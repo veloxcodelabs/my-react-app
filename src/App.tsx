@@ -159,10 +159,11 @@ export default function App() {
           <Route path="/Promo" element={<Promo />} />
         </Routes>
 
-        <div id="paypal-container" style={{ marginTop: 80, textAlign: 'center' }} />
+        <div id="paypal-container" style={{ display: 'none' }} />
 
         <div style={{ textAlign: 'center', marginTop: 120 }}>
           <Link to="/contact" style={{ margin: '0 1rem' }}>Contact</Link>
+          <a href="https://obssettings.martitony.com" style={{ margin: '0 1rem' }}>Free OBS Settings Generator</a>
         </div>
 
         <div style={{ textAlign: 'center', fontSize: 10, color: '#777', marginTop: 40, paddingBottom: 30 }} />
