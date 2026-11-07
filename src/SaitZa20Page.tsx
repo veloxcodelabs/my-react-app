@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { isGeneratorHost, MAIN_SITE_URL } from "./generatorHost";
 
 const STORAGE_KEY = "sait-za-20-used-emails";
 const PREVIEW_KEY = "sait-za-20-preview";
@@ -339,9 +340,15 @@ export default function SaitZa20Page() {
         @keyframes sait-pulse { 50% { opacity: .45; } }
       `}</style>
       <header style={headerStyle}>
-        <Link to="/" style={backLinkStyle}>
-          ← Начало
-        </Link>
+        {isGeneratorHost(window.location.hostname) ? (
+          <a href={MAIN_SITE_URL} style={backLinkStyle}>
+            ← Начало
+          </a>
+        ) : (
+          <Link to="/" style={backLinkStyle}>
+            ← Начало
+          </Link>
+        )}
       </header>
       <main style={preview ? wideStyle : mainStyle}>
         <p style={eyebrowStyle}>Marti Tony Studio</p>

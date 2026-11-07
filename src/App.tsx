@@ -5,6 +5,7 @@ import { BrowserRouter as Router, Route, Routes, Link, useLocation } from "react
 import { createClient } from '@supabase/supabase-js';
 import Promo from './promo'; // Assuming you have a Promo.js or Promo.tsx
 import SaitZa20Page from "./SaitZa20Page";
+import { GENERATOR_URL, isGeneratorHost } from "./generatorHost";
 
 // Initialize Supabase client
 const supabase = createClient(
@@ -133,9 +134,9 @@ function Home() {
   return (
     <>
       {pathname === "/" && (
-        <Link to="/sait-za-20" style={offerBannerStyle}>
+        <a href={GENERATOR_URL} style={offerBannerStyle}>
           Сайт за €20 — опиши го и го виж безплатно
-        </Link>
+        </a>
       )}
       <div style={container}>
         <div style={missionSection}>
@@ -191,7 +192,10 @@ export default function App() {
 
 function AppSwitch() {
   const { pathname } = useLocation();
-  const isOffer = pathname === "/sait-za-20" || pathname === "/sait-za-20/";
+  const isOffer =
+    isGeneratorHost(window.location.hostname) ||
+    pathname === "/sait-za-20" ||
+    pathname === "/sait-za-20/";
 
   useEffect(() => {
     window.scrollTo(0, 0);

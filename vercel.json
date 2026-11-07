@@ -1,4 +1,30 @@
 {
+  "redirects": [
+    {
+      "source": "/sait-za-20",
+      "has": [{ "type": "host", "value": "martitony.com" }],
+      "destination": "https://site.martitony.com",
+      "permanent": true
+    },
+    {
+      "source": "/sait-za-20/",
+      "has": [{ "type": "host", "value": "martitony.com" }],
+      "destination": "https://site.martitony.com",
+      "permanent": true
+    },
+    {
+      "source": "/sait-za-20",
+      "has": [{ "type": "host", "value": "www.martitony.com" }],
+      "destination": "https://site.martitony.com",
+      "permanent": true
+    },
+    {
+      "source": "/sait-za-20/",
+      "has": [{ "type": "host", "value": "www.martitony.com" }],
+      "destination": "https://site.martitony.com",
+      "permanent": true
+    }
+  ],
   "rewrites": [
     { "source": "/(.*)", "destination": "/index.html" }
   ],
