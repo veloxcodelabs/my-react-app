@@ -6,14 +6,14 @@
  *
  * Env:
  * - GEMINI_API_KEY: Google Gemini API key (required to generate)
- * - GEMINI_MODEL: optional model id, default gemini-3.8-flash
+ * - GEMINI_MODEL: optional model id, default gemini-3.5-flash-lite
  * - RESEND_API_KEY: owner email backup
  * - RESEND_FROM_EMAIL: optional verified sender
  * - SAIT20_WEBHOOK_URL / SAIT20_WEBHOOK_KEY: optional JSON webhook
  */
 
 const OWNER_EMAIL = "info@martitony.com";
-const DEFAULT_MODEL = "gemini-3.8-flash";
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_PROMPT = 2000;
 const MAX_BUSINESS = 120;
@@ -23,16 +23,11 @@ const USED_EMAILS = new Set();
 const IN_FLIGHT = new Set();
 const RATE_HITS = new Map();
 
-const SITE_INSTRUCTIONS = `You write one complete, beautiful, responsive HTML5 document for a small-business website.
-Rules:
-- All visible text is Bulgarian.
-- One file only. Put all CSS in a single <style> block in the head. No external stylesheets, fonts, images, or scripts.
-- No <script>, no iframes, no javascript: URLs, no event-handler attributes.
-- Modern, distinctive layout that fits the business. Use the business name as the title and hero.
-- Build the sections the visitor described. If they did not name sections, include a hero, about, offer, and contact.
-- Pictures are CSS gradients, shapes, or inline SVG only. Do not use http(s) image URLs.
-- The page must look finished on a phone and on a desktop.
-- Output only the document, starting with <!DOCTYPE html>. No markdown.`;
+const SITE_INSTRUCTIONS = `Write one compact Bulgarian business page as a single HTML document.
+Output only the document, from <!DOCTYPE html> through </html>. No markdown and no commentary.
+Stay under 160 lines. One short <style> block. No <script>, no external URLs, no webfonts, no comments.
+Include a header, a hero with the business name, only the sections the visitor named, and a short footer.
+Use CSS gradients for pictures. All visible text is Bulgarian. It must fit a phone screen.`;
 
 function env(name) {
   const value = process.env[name];
@@ -213,41 +208,53 @@ function textFromGemini(data) {
     .join("");
 }
 
-async function readGeminiStream(response) {
+function takeSseText(buffer, onText) {
+  const lines = buffer.split(/\r?\n/);
+  const rest = lines.pop() || "";
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    let json;
+    try {
+      json = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    const chunk = textFromGemini(json);
+    if (chunk) onText(chunk);
+  }
+  return rest;
+}
+
+async function readGeminiStream(response, onDelta) {
+  let text = "";
+  let logged = false;
+  const push = (chunk) => {
+    if (!logged) {
+      console.error("gemini first text");
+      logged = true;
+    }
+    text += chunk;
+    if (onDelta) onDelta(chunk);
+  };
+
   if (!response.body || typeof response.body.getReader !== "function") {
     const data = await response.json().catch(() => ({}));
-    return textFromGemini(data);
+    const chunk = textFromGemini(data);
+    if (chunk) push(chunk);
+    return text;
   }
+
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let text = "";
-  let logged = false;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) continue;
-      const payload = trimmed.slice(5).trim();
-      if (!payload || payload === "[DONE]") continue;
-      let json;
-      try {
-        json = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      const chunk = textFromGemini(json);
-      if (!chunk) continue;
-      if (!logged) {
-        console.error("gemini first text");
-        logged = true;
-      }
-      text += chunk;
-    }
+    buffer = takeSseText(buffer, push);
     if (/<\/body>/i.test(text) && /<\/html>/i.test(text)) {
       try {
         await reader.cancel();
@@ -257,19 +264,12 @@ async function readGeminiStream(response) {
       break;
     }
   }
-  if (!text.trim() && buffer.trim()) {
-    try {
-      const parsed = JSON.parse(buffer);
-      const items = Array.isArray(parsed) ? parsed : [parsed];
-      text = items.map((item) => textFromGemini(item)).join("");
-    } catch {
-      // Not a JSON body.
-    }
-  }
+  buffer += decoder.decode();
+  if (buffer.trim()) takeSseText(`${buffer}\n`, push);
   return text;
 }
 
-async function generateWithGemini({ business, prompt }) {
+async function generateWithGemini({ business, prompt }, onDelta) {
   const apiKey = env("GEMINI_API_KEY");
   if (!apiKey) {
     console.error("GEMINI_API_KEY is not set");
@@ -278,32 +278,37 @@ async function generateWithGemini({ business, prompt }) {
 
   const model = geminiModel();
   const businessLine = business || "бизнес без посочено име";
-  const response = await fetch(`${GEMINI_URL}/${model}:streamGenerateContent?alt=sse`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SITE_INSTRUCTIONS }] },
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: `Име на бизнеса: ${businessLine}\n\nОписание от клиента:\n${prompt}`,
-            },
-          ],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 16000,
-        thinkingConfig: { thinkingLevel: "low" },
+  let response;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    response = await fetch(`${GEMINI_URL}/${model}:streamGenerateContent?alt=sse`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
       },
-    }),
-    signal: AbortSignal.timeout(110000),
-  });
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SITE_INSTRUCTIONS }] },
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `Бизнес: ${businessLine}\nСтраница: ${prompt}\nНаправи кратката страница сега.`,
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.4,
+          maxOutputTokens: 4096,
+          thinkingConfig: { thinkingLevel: "minimal" },
+        },
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+    if (response.ok || response.status !== 503 || attempt === 1) break;
+    console.error("gemini busy, retrying");
+  }
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
@@ -317,9 +322,23 @@ async function generateWithGemini({ business, prompt }) {
     throw geminiError("generation", "gemini failed");
   }
 
-  const text = await readGeminiStream(response);
+  const text = await readGeminiStream(response, onDelta);
   if (!text.trim()) throw geminiError("generation", "empty model response");
   return text;
+}
+
+function startStream(res) {
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+}
+
+function writeEvent(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  if (typeof res.flush === "function") res.flush();
 }
 
 async function postWebhook(payload) {
@@ -503,11 +522,41 @@ async function handler(req, res) {
   }
 
   IN_FLIGHT.add(email);
+  let streaming = false;
+  const fail = (error) => {
+    const code = error && error.code;
+    console.error("preview generation failed", code || "unknown");
+    const message =
+      code === "quota"
+        ? "Генераторът е временно зает заради лимит. Опитай отново след малко."
+        : code === "config"
+          ? "Генераторът не е настроен в момента. Пиши на info@martitony.com."
+          : "Не успяхме да направим прегледа. Опитай отново след малко.";
+    const errorName = code === "quota" ? "quota" : code === "config" ? "config" : "generation";
+    if (!streaming) {
+      reply(res, code === "quota" ? 429 : 503, { ok: false, error: errorName, message });
+      return;
+    }
+    writeEvent(res, { type: "error", error: errorName, message });
+    res.end();
+  };
+
   try {
+    const onDelta = (text) => {
+      if (!streaming) {
+        startStream(res);
+        streaming = true;
+      }
+      writeEvent(res, { type: "delta", text });
+    };
     const raw = handler._generate
       ? await handler._generate({ email, business, prompt })
-      : await generateWithGemini({ business, prompt });
+      : await generateWithGemini({ business, prompt }, onDelta);
+    if (handler._generate) onDelta(raw);
     const generatedHtml = sanitizePreviewHtml(raw);
+    if (!/<\/body>/i.test(generatedHtml) || !/<\/html>/i.test(generatedHtml)) {
+      throw geminiError("generation", "incomplete html");
+    }
     const payload = {
       email,
       business,
@@ -518,26 +567,11 @@ async function handler(req, res) {
 
     await Promise.all([postWebhook(payload), sendOwnerEmail(payload)]);
     await rememberEmail(email);
-    reply(res, 200, { ok: true, html: generatedHtml });
+    if (!streaming) startStream(res);
+    writeEvent(res, { type: "done", html: generatedHtml });
+    res.end();
   } catch (error) {
-    const code = error && error.code;
-    console.error("preview generation failed", code || "unknown");
-    if (code === "quota") {
-      reply(res, 429, {
-        ok: false,
-        error: "quota",
-        message: "Генераторът е временно зает заради лимит. Опитай отново след малко.",
-      });
-      return;
-    }
-    reply(res, 503, {
-      ok: false,
-      error: code === "config" ? "config" : "generation",
-      message:
-        code === "config"
-          ? "Генераторът не е настроен в момента. Пиши на info@martitony.com."
-          : "Не успяхме да направим прегледа. Опитай отново след малко.",
-    });
+    fail(error);
   } finally {
     IN_FLIGHT.delete(email);
   }
@@ -549,5 +583,5 @@ handler._reset = () => {
   RATE_HITS.clear();
 };
 
-export const config = { maxDuration: 120 };
+export const config = { maxDuration: 60 };
 export default handler;

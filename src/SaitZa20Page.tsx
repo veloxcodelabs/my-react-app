@@ -50,6 +50,12 @@ function readPreview(): Preview | null {
   }
 }
 
+function liveDocument(raw: string) {
+  const trimmed = raw.trim();
+  if (/<html[\s>]/i.test(trimmed)) return trimmed;
+  return `<!DOCTYPE html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body>${trimmed}</body></html>`;
+}
+
 function choiceLabel(choice: Choice) {
   return choice === "buy" ? "Купувам за €20" : "Искам още дизайн";
 }
@@ -146,29 +152,74 @@ export default function SaitZa20Page() {
           prompt: nextPrompt,
         }),
       });
-      const data = await response.json().catch(() => ({}));
-      if (response.status === 409 || data.error === "duplicate") {
-        rememberEmail(nextEmail);
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("text/event-stream")) {
+        const data = await response.json().catch(() => ({}));
+        if (response.status === 409 || data.error === "duplicate") {
+          rememberEmail(nextEmail);
+          setStatus("error");
+          setMessage(data.message || "Този имейл вече е използван за безплатния преглед.");
+          return;
+        }
         setStatus("error");
-        setMessage(data.message || "Този имейл вече е използван за безплатния преглед.");
+        setMessage(data.message || "Не успяхме да направим прегледа. Опитай отново след малко.");
         return;
       }
-      if (!response.ok || data.ok === false || typeof data.html !== "string") {
+
+      const reader = response.body?.getReader();
+      if (!reader) {
         setStatus("error");
-        setMessage(data.message || "Нещо се обърка. Опитай отново след малко.");
+        setMessage("Не успяхме да направим прегледа. Опитай отново след малко.");
         return;
       }
-      const nextPreview = { email: nextEmail, business: nextBusiness, html: data.html };
-      rememberEmail(nextEmail);
-      try {
-        sessionStorage.setItem(PREVIEW_KEY, JSON.stringify(nextPreview));
-      } catch {
-        // The preview still stays on screen if the browser refuses to store it.
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let raw = "";
+      let paintedAt = 0;
+      let finished = false;
+      while (!finished) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() || "";
+        for (const block of blocks) {
+          const line = block.split("\n").find((item) => item.startsWith("data:"));
+          if (!line) continue;
+          const event = JSON.parse(line.slice(5).trim());
+          if (event.type === "delta" && typeof event.text === "string") {
+            raw += event.text;
+            const now = Date.now();
+            if (now - paintedAt > 120) {
+              paintedAt = now;
+              setPreview({ email: nextEmail, business: nextBusiness, html: liveDocument(raw) });
+            }
+          } else if (event.type === "done" && typeof event.html === "string") {
+            const nextPreview = { email: nextEmail, business: nextBusiness, html: event.html };
+            rememberEmail(nextEmail);
+            try {
+              sessionStorage.setItem(PREVIEW_KEY, JSON.stringify(nextPreview));
+            } catch {
+              // The preview still stays on screen if the browser refuses to store it.
+            }
+            setPreview(nextPreview);
+            setChoice(null);
+            setNote("");
+            setStatus("idle");
+            finished = true;
+          } else if (event.type === "error") {
+            setPreview(null);
+            setStatus("error");
+            setMessage(event.message || "Не успяхме да направим прегледа. Опитай отново след малко.");
+            finished = true;
+          }
+        }
       }
-      setPreview(nextPreview);
-      setChoice(null);
-      setNote("");
-      setStatus("idle");
+      if (!finished) {
+        setPreview(null);
+        setStatus("error");
+        setMessage("Не успяхме да направим прегледа. Опитай отново след малко.");
+      }
     } catch {
       setStatus("error");
       setMessage("Няма връзка. Провери интернета и опитай отново.");
@@ -197,6 +248,7 @@ export default function SaitZa20Page() {
         {preview ? (
           <section aria-live="polite">
             <div style={previewLabelStyle}>ПРЕГЛЕД</div>
+            {status === "sending" ? <p style={hintStyle}>Генерираме прегледа…</p> : null}
             <div style={frameWrapStyle}>
               <iframe
                 ref={frameRef}

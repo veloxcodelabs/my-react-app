@@ -21,7 +21,28 @@ function mockRes() {
       this.payload = body;
       return this;
     },
+    chunks: "",
+    write(chunk) {
+      this.chunks += chunk;
+    },
+    end() {
+      this.ended = true;
+    },
+    flushHeaders() {},
   };
+}
+
+function doneHtml(res) {
+  const events = String(res.chunks || "")
+    .split("\n\n")
+    .map((block) => {
+      const line = block.split("\n").find((item) => item.startsWith("data:"));
+      return line ? JSON.parse(line.slice(5).trim()) : null;
+    })
+    .filter(Boolean);
+  const done = events.filter((event) => event.type === "done").pop();
+  if (!done) throw new Error(`missing done event: ${res.chunks}`);
+  return done.html;
 }
 
 function submit(body, method = "POST", headers = {}) {
@@ -86,11 +107,12 @@ solo("returns sanitized html and notifies the owner", async () => {
   });
 
   assert.equal(res.statusCode, 200);
-  assert.equal(res.payload.ok, true);
-  assert.match(res.payload.html, /Здравей/);
-  assert.match(res.payload.html, /ПРЕГЛЕД/);
-  assert.doesNotMatch(res.payload.html, /<script/i);
-  assert.doesNotMatch(res.payload.html, /evil\.example/);
+  const html = doneHtml(res);
+  assert.match(html, /Здравей/);
+  assert.match(html, /ПРЕГЛЕД/);
+  assert.match(html, /<\/html>/i);
+  assert.doesNotMatch(html, /<script/i);
+  assert.doesNotMatch(html, /evil\.example/);
 
   const webhook = calls.find((call) => call.url === "https://hooks.example.com/sait");
   const email = calls.find((call) => call.url === "https://api.resend.com/emails");
@@ -111,6 +133,8 @@ solo("returns sanitized html and notifies the owner", async () => {
   assert.equal(payload.business, "Пекарна");
   assert.equal(payload.prompt, prompt);
   assert.match(payload.generatedHtml, /ПРЕГЛЕД/);
+  assert.match(payload.generatedHtml, /<\/html>/i);
+  assert.equal(payload.generatedHtml, html);
   assert.doesNotMatch(payload.generatedHtml, /<script/i);
 
   const message = JSON.parse(email.options.body);
@@ -140,7 +164,7 @@ solo("still shows the preview when notification is not configured", async () => 
   };
   const res = await submit({ email: "none@example.com", prompt });
   assert.equal(res.statusCode, 200);
-  assert.match(res.payload.html, /Здравей/);
+  assert.match(doneHtml(res), /Здравей/);
 });
 
 solo("allows one free generation per email", async () => {
@@ -210,6 +234,8 @@ solo("explains a Gemini quota limit and still allows a retry", async () => {
   assert.match(limited.payload.message, /лимит/);
   assert.equal(calls.length, 1);
   assert.match(calls[0].url, /models\/gemini-3\.8-flash:streamGenerateContent\?alt=sse$/);
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, "minimal");
   assert.equal(calls[0].url.includes("test-gemini-key"), false);
   assert.equal(calls[0].options.headers["x-goog-api-key"], "test-gemini-key");
 
