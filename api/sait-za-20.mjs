@@ -5,18 +5,16 @@
  * emails info@martitony.com, and POSTs the same submission to the webhook.
  *
  * Env:
- * - VERCEL_OIDC_TOKEN: set automatically on Vercel; authenticates AI Gateway
- * - AI_GATEWAY_API_KEY: only for local/non-Vercel runs (used instead of OIDC)
- * - AI_GATEWAY_MODEL: optional provider/model id; default google/gemini-3.8-flash
+ * - GEMINI_API_KEY: Google Gemini API key (required to generate)
+ * - GEMINI_MODEL: optional model id, default gemini-3.8-flash
  * - RESEND_API_KEY: owner email backup
  * - RESEND_FROM_EMAIL: optional verified sender
  * - SAIT20_WEBHOOK_URL / SAIT20_WEBHOOK_KEY: optional JSON webhook
  */
 
-import { generateText } from "ai";
-
 const OWNER_EMAIL = "info@martitony.com";
-const DEFAULT_MODEL = "google/gemini-3.8-flash";
+const DEFAULT_MODEL = "gemini-3.8-flash";
+const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_PROMPT = 2000;
 const MAX_BUSINESS = 120;
 const RATE_WINDOW_MS = 10 * 60 * 1000;
@@ -193,23 +191,73 @@ export function sanitizePreviewHtml(raw) {
   return html;
 }
 
-async function generateWithGateway({ business, prompt }) {
-  const model = env("AI_GATEWAY_MODEL") || DEFAULT_MODEL;
-  const businessLine = business || "бизнес без посочено име";
-  const result = await generateText({
-    model,
-    instructions: SITE_INSTRUCTIONS,
-    prompt: `Име на бизнеса: ${businessLine}\n\nОписание от клиента:\n${prompt}`,
-    maxOutputTokens: 8000,
-    temperature: 0.7,
-    reasoning: "low",
-    maxRetries: 0,
-    timeout: 50000,
-  });
-  if (!result.text || !result.text.trim()) {
-    throw new Error("empty model response");
+function geminiError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function geminiModel() {
+  const model = env("GEMINI_MODEL") || DEFAULT_MODEL;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(model)) {
+    throw geminiError("config", "invalid model");
   }
-  return result.text;
+  return model;
+}
+
+async function generateWithGemini({ business, prompt }) {
+  const apiKey = env("GEMINI_API_KEY");
+  if (!apiKey) {
+    console.error("GEMINI_API_KEY is not set");
+    throw geminiError("config", "missing key");
+  }
+
+  const model = geminiModel();
+  const businessLine = business || "бизнес без посочено име";
+  const response = await fetch(`${GEMINI_URL}/${model}:generateContent`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SITE_INSTRUCTIONS }] },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `Име на бизнеса: ${businessLine}\n\nОписание от клиента:\n${prompt}`,
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 8000,
+        thinkingConfig: { thinkingLevel: "low" },
+      },
+    }),
+    signal: AbortSignal.timeout(50000),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  const statusName = data && data.error && data.error.status;
+  if (response.status === 429 || statusName === "RESOURCE_EXHAUSTED") {
+    throw geminiError("quota", "gemini quota");
+  }
+  if (!response.ok) {
+    console.error("gemini failed", response.status, statusName || "");
+    throw geminiError("generation", "gemini failed");
+  }
+
+  const text = (data.candidates || [])
+    .flatMap((candidate) => (candidate.content && candidate.content.parts) || [])
+    .filter((part) => part && !part.thought)
+    .map((part) => part.text || "")
+    .join("");
+  if (!text.trim()) throw geminiError("generation", "empty model response");
+  return text;
 }
 
 async function postWebhook(payload) {
@@ -396,7 +444,7 @@ async function handler(req, res) {
   try {
     const raw = handler._generate
       ? await handler._generate({ email, business, prompt })
-      : await generateWithGateway({ business, prompt });
+      : await generateWithGemini({ business, prompt });
     const generatedHtml = sanitizePreviewHtml(raw);
     const payload = {
       email,
@@ -410,11 +458,23 @@ async function handler(req, res) {
     await rememberEmail(email);
     reply(res, 200, { ok: true, html: generatedHtml });
   } catch (error) {
-    console.error("preview generation failed", error && error.message ? error.message : "unknown");
+    const code = error && error.code;
+    console.error("preview generation failed", code || "unknown");
+    if (code === "quota") {
+      reply(res, 429, {
+        ok: false,
+        error: "quota",
+        message: "Генераторът е временно зает заради лимит. Опитай отново след малко.",
+      });
+      return;
+    }
     reply(res, 503, {
       ok: false,
-      error: "generation",
-      message: "Не успяхме да направим прегледа. Опитай отново след малко.",
+      error: code === "config" ? "config" : "generation",
+      message:
+        code === "config"
+          ? "Генераторът не е настроен в момента. Пиши на info@martitony.com."
+          : "Не успяхме да направим прегледа. Опитай отново след малко.",
     });
   } finally {
     IN_FLIGHT.delete(email);

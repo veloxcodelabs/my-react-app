@@ -44,7 +44,8 @@ function solo(name, fn) {
     delete process.env.RESEND_FROM_EMAIL;
     delete process.env.SAIT20_WEBHOOK_URL;
     delete process.env.SAIT20_WEBHOOK_KEY;
-    delete process.env.AI_GATEWAY_MODEL;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_MODEL;
     await fn();
   });
   tail = done.then(
@@ -187,4 +188,43 @@ solo("rate limits an address after five generations", async () => {
   );
   assert.equal(blocked.statusCode, 429);
   assert.equal(blocked.payload.error, "rate");
+});
+
+solo("explains a Gemini quota limit and still allows a retry", async () => {
+  delete handler._generate;
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  process.env.GEMINI_MODEL = "gemini-3.8-flash";
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return {
+      ok: false,
+      status: 429,
+      json: async () => ({ error: { code: 429, status: "RESOURCE_EXHAUSTED" } }),
+    };
+  };
+
+  const limited = await submit({ email: "quota@example.com", prompt });
+  assert.equal(limited.statusCode, 429);
+  assert.equal(limited.payload.error, "quota");
+  assert.match(limited.payload.message, /лимит/);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /models\/gemini-3\.8-flash:generateContent$/);
+  assert.equal(calls[0].url.includes("test-gemini-key"), false);
+  assert.equal(calls[0].options.headers["x-goog-api-key"], "test-gemini-key");
+
+  handler._generate = async () => FIXTURE;
+  const again = await submit({ email: "quota@example.com", prompt });
+  assert.equal(again.statusCode, 200);
+});
+
+solo("says the generator is not configured when the key is missing", async () => {
+  delete handler._generate;
+  global.fetch = async () => {
+    throw new Error("gemini should not be called");
+  };
+  const res = await submit({ email: "nokey@example.com", prompt });
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.payload.error, "config");
+  assert.match(res.payload.message, /info@martitony.com/);
 });
