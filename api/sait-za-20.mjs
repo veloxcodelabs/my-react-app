@@ -238,7 +238,7 @@ async function generateWithGemini({ business, prompt }) {
         thinkingConfig: { thinkingLevel: "low" },
       },
     }),
-    signal: AbortSignal.timeout(50000),
+    signal: AbortSignal.timeout(100000),
   });
 
   const data = await response.json().catch(() => ({}));
@@ -489,5 +489,5 @@ handler._reset = () => {
   RATE_HITS.clear();
 };
 
-export const config = { maxDuration: 60 };
+export const config = { maxDuration: 120 };
 export default handler;

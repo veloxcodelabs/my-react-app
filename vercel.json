@@ -4,7 +4,7 @@
   ],
   "functions": {
     "api/sait-za-20.mjs": {
-      "maxDuration": 60
+      "maxDuration": 120
     }
   }
 }
