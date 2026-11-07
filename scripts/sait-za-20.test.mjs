@@ -209,7 +209,7 @@ solo("explains a Gemini quota limit and still allows a retry", async () => {
   assert.equal(limited.payload.error, "quota");
   assert.match(limited.payload.message, /лимит/);
   assert.equal(calls.length, 1);
-  assert.match(calls[0].url, /models\/gemini-3\.8-flash:generateContent$/);
+  assert.match(calls[0].url, /models\/gemini-3\.8-flash:streamGenerateContent\?alt=sse$/);
   assert.equal(calls[0].url.includes("test-gemini-key"), false);
   assert.equal(calls[0].options.headers["x-goog-api-key"], "test-gemini-key");
 

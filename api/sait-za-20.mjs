@@ -205,6 +205,70 @@ function geminiModel() {
   return model;
 }
 
+function textFromGemini(data) {
+  return (data.candidates || [])
+    .flatMap((candidate) => (candidate.content && candidate.content.parts) || [])
+    .filter((part) => part && !part.thought)
+    .map((part) => part.text || "")
+    .join("");
+}
+
+async function readGeminiStream(response) {
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const data = await response.json().catch(() => ({}));
+    return textFromGemini(data);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let logged = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      let json;
+      try {
+        json = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      const chunk = textFromGemini(json);
+      if (!chunk) continue;
+      if (!logged) {
+        console.error("gemini first text");
+        logged = true;
+      }
+      text += chunk;
+    }
+    if (/<\/html>/i.test(text)) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The document is already complete.
+      }
+      break;
+    }
+  }
+  if (!text.trim() && buffer.trim()) {
+    try {
+      const parsed = JSON.parse(buffer);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      text = items.map((item) => textFromGemini(item)).join("");
+    } catch {
+      // Not a JSON body.
+    }
+  }
+  return text;
+}
+
 async function generateWithGemini({ business, prompt }) {
   const apiKey = env("GEMINI_API_KEY");
   if (!apiKey) {
@@ -214,7 +278,7 @@ async function generateWithGemini({ business, prompt }) {
 
   const model = geminiModel();
   const businessLine = business || "бизнес без посочено име";
-  const response = await fetch(`${GEMINI_URL}/${model}:generateContent`, {
+  const response = await fetch(`${GEMINI_URL}/${model}:streamGenerateContent?alt=sse`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -234,30 +298,26 @@ async function generateWithGemini({ business, prompt }) {
       ],
       generationConfig: {
         temperature: 0.7,
-        maxOutputTokens: 8000,
+        maxOutputTokens: 5000,
         thinkingConfig: { thinkingLevel: "low" },
       },
     }),
-    signal: AbortSignal.timeout(100000),
+    signal: AbortSignal.timeout(110000),
   });
 
-  const data = await response.json().catch(() => ({}));
-  const statusName = data && data.error && data.error.status;
-  const geminiMessage = String((data && data.error && data.error.message) || "").slice(0, 300);
-  if (response.status === 429 || statusName === "RESOURCE_EXHAUSTED") {
-    console.error("gemini quota", response.status, statusName || "", geminiMessage);
-    throw geminiError("quota", "gemini quota");
-  }
   if (!response.ok) {
-    console.error("gemini failed", response.status, statusName || "");
+    const data = await response.json().catch(() => ({}));
+    const statusName = data && data.error && data.error.status;
+    const geminiMessage = String((data && data.error && data.error.message) || "").slice(0, 300);
+    if (response.status === 429 || response.status === 402 || statusName === "RESOURCE_EXHAUSTED") {
+      console.error("gemini quota", response.status, statusName || "", geminiMessage);
+      throw geminiError("quota", "gemini quota");
+    }
+    console.error("gemini failed", response.status, statusName || "", geminiMessage);
     throw geminiError("generation", "gemini failed");
   }
 
-  const text = (data.candidates || [])
-    .flatMap((candidate) => (candidate.content && candidate.content.parts) || [])
-    .filter((part) => part && !part.thought)
-    .map((part) => part.text || "")
-    .join("");
+  const text = await readGeminiStream(response);
   if (!text.trim()) throw geminiError("generation", "empty model response");
   return text;
 }
