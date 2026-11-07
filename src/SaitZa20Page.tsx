@@ -4,9 +4,21 @@ import { Link } from "react-router-dom";
 const STORAGE_KEY = "sait-za-20-used-emails";
 const PREVIEW_KEY = "sait-za-20-preview";
 const MAX_PROMPT = 2000;
+const MAX_PHOTOS = 3;
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
+const MAX_EDGE = 1600;
 
 type Status = "idle" | "sending" | "error";
 type Choice = "buy" | "design";
+type PhotoRole = "style" | "embed";
+
+interface Photo {
+  id: string;
+  name: string;
+  mime: string;
+  dataUrl: string;
+  role: PhotoRole;
+}
 
 interface Preview {
   email: string;
@@ -50,6 +62,56 @@ function readPreview(): Preview | null {
   }
 }
 
+function applyPhotoTokens(html: string, photos: Photo[]) {
+  let next = html;
+  photos
+    .filter((photo) => photo.role === "embed")
+    .forEach((photo, index) => {
+      next = next.split(`{{PHOTO_${index + 1}}}`).join(photo.dataUrl);
+    });
+  return next;
+}
+
+async function compressPhoto(file: File): Promise<Photo> {
+  const mime = file.type === "image/jpg" ? "image/jpeg" : file.type;
+  if (mime !== "image/jpeg" && mime !== "image/png" && mime !== "image/webp") {
+    throw new Error("Само JPG, PNG или WebP.");
+  }
+  if (file.size > MAX_PHOTO_BYTES) {
+    throw new Error("Всяка снимка трябва да е до 5 MB.");
+  }
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+  const width = Math.max(1, Math.round(bitmap.width * scale));
+  const height = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Не успяхме да обработим снимката.");
+  context.drawImage(bitmap, 0, 0, width, height);
+  bitmap.close();
+  const outputMime = canvas.toDataURL("image/webp").startsWith("data:image/webp")
+    ? "image/webp"
+    : "image/jpeg";
+  let quality = 0.82;
+  let dataUrl = canvas.toDataURL(outputMime, quality);
+  while (dataUrl.length > 800000 && quality > 0.45) {
+    quality -= 0.12;
+    dataUrl = canvas.toDataURL(outputMime, quality);
+  }
+  if (dataUrl.length > 1000000) {
+    throw new Error("Снимката е твърде голяма след компресия. Качи по-малък файл.");
+  }
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: file.name,
+    mime: outputMime,
+    dataUrl,
+    role: "embed",
+  };
+}
+
 function liveDocument(raw: string) {
   const trimmed = raw.trim();
   if (/<html[\s>]/i.test(trimmed)) return trimmed;
@@ -81,7 +143,9 @@ export default function SaitZa20Page() {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [choice, setChoice] = useState<Choice | null>(null);
   const [note, setNote] = useState("");
+  const [photos, setPhotos] = useState<Photo[]>([]);
   const frameRef = useRef<HTMLIFrameElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const previousTitle = document.title;
@@ -106,6 +170,37 @@ export default function SaitZa20Page() {
     () => (preview && choice ? mailHref(choice, preview, note) : ""),
     [preview, choice, note]
   );
+
+  async function addPhotos(fileList: FileList | null) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    if (photos.length >= MAX_PHOTOS) {
+      setStatus("error");
+      setMessage("Можеш да качиш до 3 снимки.");
+      return;
+    }
+    const room = MAX_PHOTOS - photos.length;
+    const accepted = files.slice(0, room);
+    if (files.length > room) {
+      setStatus("error");
+      setMessage("Можеш да качиш до 3 снимки.");
+    } else {
+      setMessage("");
+      setStatus("idle");
+    }
+    try {
+      const next = [];
+      for (const file of accepted) next.push(await compressPhoto(file));
+      setPhotos((current) => [...current, ...next].slice(0, MAX_PHOTOS));
+    } catch (error) {
+      setStatus("error");
+      setMessage(error instanceof Error ? error.message : "Не успяхме да обработим снимката.");
+    }
+  }
+
+  function setPhotoRole(id: string, role: PhotoRole) {
+    setPhotos((current) => current.map((photo) => (photo.id === id ? { ...photo, role } : photo)));
+  }
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -138,19 +233,27 @@ export default function SaitZa20Page() {
       setMessage("Този имейл вече е използван за безплатния преглед.");
       return;
     }
+    const payload = JSON.stringify({
+      email: nextEmail,
+      business: nextBusiness,
+      prompt: nextPrompt,
+      images: photos.map((photo) => ({ role: photo.role, mime: photo.mime, data: photo.dataUrl })),
+    });
+    if (payload.length > 3800000) {
+      setStatus("error");
+      setMessage("Снимките заедно са твърде големи. Махни една или качи по-малки.");
+      return;
+    }
 
     setStatus("sending");
     setMessage("");
+    const chosenPhotos = photos;
 
     try {
       const response = await fetch("/api/sait-za-20", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          email: nextEmail,
-          business: nextBusiness,
-          prompt: nextPrompt,
-        }),
+        body: payload,
       });
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("text/event-stream")) {
@@ -192,7 +295,11 @@ export default function SaitZa20Page() {
             const now = Date.now();
             if (now - paintedAt > 120) {
               paintedAt = now;
-              setPreview({ email: nextEmail, business: nextBusiness, html: liveDocument(raw) });
+              setPreview({
+                email: nextEmail,
+                business: nextBusiness,
+                html: applyPhotoTokens(liveDocument(raw), chosenPhotos),
+              });
             }
           } else if (event.type === "done" && typeof event.html === "string") {
             const nextPreview = { email: nextEmail, business: nextBusiness, html: event.html };
@@ -360,6 +467,56 @@ export default function SaitZa20Page() {
               {prompt.trim().length}/{MAX_PROMPT}
             </p>
 
+            <div style={photoBlockStyle}>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                multiple
+                hidden
+                onChange={(event) => {
+                  void addPhotos(event.target.files);
+                  event.target.value = "";
+                }}
+              />
+              <button type="button" style={uploadButtonStyle} onClick={() => fileRef.current?.click()}>
+                Качи снимки
+              </button>
+              <p style={hintStyle}>До 3 снимки · JPG, PNG или WebP · до 5 MB всяка</p>
+              {photos.map((photo) => (
+                <div key={photo.id} style={photoRowStyle}>
+                  <img src={photo.dataUrl} alt="" style={thumbStyle} />
+                  <div style={photoMetaStyle}>
+                    <div style={roleRowStyle}>
+                      <button
+                        type="button"
+                        aria-pressed={photo.role === "style"}
+                        style={photo.role === "style" ? roleOnStyle : roleOffStyle}
+                        onClick={() => setPhotoRole(photo.id, "style")}
+                      >
+                        Пример за стил
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={photo.role === "embed"}
+                        style={photo.role === "embed" ? roleOnStyle : roleOffStyle}
+                        onClick={() => setPhotoRole(photo.id, "embed")}
+                      >
+                        Сложи в сайта
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      style={removeStyle}
+                      onClick={() => setPhotos((current) => current.filter((item) => item.id !== photo.id))}
+                    >
+                      Махни
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
             {status === "error" && message ? (
               <p role="alert" style={errorStyle}>
                 {message}
@@ -470,6 +627,81 @@ const textareaStyle: React.CSSProperties = {
   minHeight: 140,
   resize: "vertical",
   lineHeight: 1.45,
+};
+
+const photoBlockStyle: React.CSSProperties = {
+  marginTop: 8,
+};
+
+const uploadButtonStyle: React.CSSProperties = {
+  width: "100%",
+  padding: "12px 16px",
+  borderRadius: 10,
+  border: "2px solid #0070f3",
+  background: "#fff",
+  color: "#0070f3",
+  fontSize: 16,
+  fontWeight: 700,
+  fontFamily: "inherit",
+  cursor: "pointer",
+};
+
+const photoRowStyle: React.CSSProperties = {
+  display: "flex",
+  gap: 12,
+  alignItems: "center",
+  marginTop: 12,
+};
+
+const thumbStyle: React.CSSProperties = {
+  width: 72,
+  height: 72,
+  objectFit: "cover",
+  borderRadius: 12,
+  background: "#fff",
+  flex: "0 0 auto",
+};
+
+const photoMetaStyle: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+};
+
+const roleRowStyle: React.CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  gap: 6,
+};
+
+const roleOffStyle: React.CSSProperties = {
+  border: "1px solid #d5d5d5",
+  background: "#fff",
+  color: "#333",
+  borderRadius: 999,
+  padding: "6px 10px",
+  fontSize: 13,
+  fontWeight: 700,
+  fontFamily: "inherit",
+  cursor: "pointer",
+};
+
+const roleOnStyle: React.CSSProperties = {
+  ...roleOffStyle,
+  borderColor: "#0070f3",
+  background: "#0070f3",
+  color: "#fff",
+};
+
+const removeStyle: React.CSSProperties = {
+  marginTop: 6,
+  border: "none",
+  background: "transparent",
+  color: "#9f1239",
+  padding: 0,
+  fontSize: 13,
+  fontWeight: 700,
+  fontFamily: "inherit",
+  cursor: "pointer",
 };
 
 const counterStyle: React.CSSProperties = {

@@ -17,6 +17,9 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_PROMPT = 2000;
 const MAX_BUSINESS = 120;
+const MAX_IMAGES = 3;
+const MAX_IMAGE_BASE64 = 1200000;
+const MAX_IMAGES_BASE64 = 3200000;
 const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_MAX = 5;
 const USED_EMAILS = new Set();
@@ -27,7 +30,8 @@ const SITE_INSTRUCTIONS = `Write one compact Bulgarian business page as a single
 Output only the document, from <!DOCTYPE html> through </html>. No markdown and no commentary.
 Stay under 160 lines. One short <style> block. No <script>, no external URLs, no webfonts, no comments.
 Include a header, a hero with the business name, only the sections the visitor named, and a short footer.
-Use CSS gradients for pictures. All visible text is Bulgarian. It must fit a phone screen.`;
+Use CSS gradients where a photo is not provided. All visible text is Bulgarian. It must fit a phone screen.
+Never write base64 or data: URLs. If the user lists {{PHOTO_N}} tokens, use those exact strings as img src values.`;
 
 function env(name) {
   const value = process.env[name];
@@ -269,7 +273,93 @@ async function readGeminiStream(response, onDelta) {
   return text;
 }
 
-async function generateWithGemini({ business, prompt }, onDelta) {
+function decodeImage(item, index) {
+  if (!item || typeof item !== "object") {
+    return { error: "Невалидна снимка." };
+  }
+  if (item.role !== "style" && item.role !== "embed") {
+    return { error: "Избери дали снимката е пример за стил или да влезе в сайта." };
+  }
+  const mime = String(item.mime || "").toLowerCase();
+  if (mime !== "image/jpeg" && mime !== "image/png" && mime !== "image/webp") {
+    return { error: "Само JPG, PNG или WebP." };
+  }
+  const source = String(item.data || "").trim();
+  const dataUrl = source.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=\s]+)$/i);
+  const b64 = (dataUrl ? dataUrl[2] : source).replace(/\s/g, "");
+  if (dataUrl && dataUrl[1].toLowerCase() !== mime) {
+    return { error: "Само JPG, PNG или WebP." };
+  }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64) || b64.length > MAX_IMAGE_BASE64) {
+    return { error: "Снимката е твърде голяма след компресия. Качи по-малък файл." };
+  }
+  const buffer = Buffer.from(b64, "base64");
+  const jpeg = buffer.length > 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  const png = buffer.length > 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47;
+  const webp = buffer.length > 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP";
+  const matches = (mime === "image/jpeg" && jpeg) || (mime === "image/png" && png) || (mime === "image/webp" && webp);
+  if (!matches) return { error: "Файлът не е валидна снимка." };
+  return { image: { role: item.role, mime, data: b64, index } };
+}
+
+function collectImages(raw) {
+  if (raw == null) return { images: [] };
+  if (!Array.isArray(raw)) return { error: "Невалидни снимки." };
+  if (raw.length > MAX_IMAGES) return { error: "Можеш да качиш до 3 снимки." };
+  const images = [];
+  let total = 0;
+  for (let i = 0; i < raw.length; i += 1) {
+    const decoded = decodeImage(raw[i], i);
+    if (decoded.error) return decoded;
+    total += decoded.image.data.length;
+    if (total > MAX_IMAGES_BASE64) {
+      return { error: "Снимките заедно са твърде големи. Махни една или качи по-малки." };
+    }
+    images.push(decoded.image);
+  }
+  return { images };
+}
+
+function insertEmbeds(html, images) {
+  const embeds = images.filter((image) => image.role === "embed");
+  let result = html;
+  const missing = [];
+  embeds.forEach((image, index) => {
+    const token = `{{PHOTO_${index + 1}}}`;
+    const url = `data:${image.mime};base64,${image.data}`;
+    if (result.includes(token)) result = result.split(token).join(url);
+    else missing.push(url);
+  });
+  if (missing.length) {
+    const gallery = `<section>${missing
+      .map((url) => `<img src="${url}" alt="" style="max-width:100%;height:auto;display:block">`)
+      .join("")}</section>`;
+    result = /<\/body>/i.test(result) ? result.replace(/<\/body>/i, `${gallery}</body>`) : `${result}${gallery}`;
+  }
+  return result;
+}
+
+function geminiUserParts({ business, prompt, images }) {
+  const embeds = images.filter((image) => image.role === "embed");
+  const styles = images.filter((image) => image.role === "style");
+  const lines = [`Бизнес: ${business || "бизнес без посочено име"}`, `Страница: ${prompt}`];
+  if (embeds.length) {
+    lines.push("Вгради снимките само с тези src стойности, без base64:");
+    embeds.forEach((_, index) => lines.push(`- {{PHOTO_${index + 1}}}`));
+    lines.push("Първата е лого или hero. Останалите са галерия.");
+  }
+  if (styles.length) {
+    lines.push("Следващите изображения са само пример за стил. Не ги вграждай и не повтаряй пикселите им.");
+  }
+  lines.push("Направи кратката страница сега.");
+  const parts = [{ text: lines.join("\n") }];
+  styles.forEach((image) => {
+    parts.push({ inlineData: { mimeType: image.mime, data: image.data } });
+  });
+  return parts;
+}
+
+async function generateWithGemini({ business, prompt, images }, onDelta) {
   const apiKey = env("GEMINI_API_KEY");
   if (!apiKey) {
     console.error("GEMINI_API_KEY is not set");
@@ -277,7 +367,6 @@ async function generateWithGemini({ business, prompt }, onDelta) {
   }
 
   const model = geminiModel();
-  const businessLine = business || "бизнес без посочено име";
   let response;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     response = await fetch(`${GEMINI_URL}/${model}:streamGenerateContent?alt=sse`, {
@@ -291,11 +380,7 @@ async function generateWithGemini({ business, prompt }, onDelta) {
         contents: [
           {
             role: "user",
-            parts: [
-              {
-                text: `Бизнес: ${businessLine}\nСтраница: ${prompt}\nНаправи кратката страница сега.`,
-              },
-            ],
+            parts: geminiUserParts({ business, prompt, images: images || [] }),
           },
         ],
         generationConfig: {
@@ -407,6 +492,8 @@ async function sendOwnerEmail(payload) {
     "Описание:",
     payload.prompt,
     "",
+    `Снимки: ${(payload.images || []).map((image) => image.role).join(", ") || "няма"}`,
+    "",
     "Генериран HTML:",
     payload.generatedHtml,
   ].join("\n");
@@ -495,6 +582,12 @@ async function handler(req, res) {
     });
     return;
   }
+  const collected = collectImages(body.images);
+  if (collected.error) {
+    reply(res, 400, { ok: false, error: "validation", message: collected.error });
+    return;
+  }
+  const images = collected.images;
 
   if (await hasUsedEmail(email)) {
     reply(res, 409, {
@@ -550,10 +643,10 @@ async function handler(req, res) {
       writeEvent(res, { type: "delta", text });
     };
     const raw = handler._generate
-      ? await handler._generate({ email, business, prompt })
-      : await generateWithGemini({ business, prompt }, onDelta);
+      ? await handler._generate({ email, business, prompt, images })
+      : await generateWithGemini({ business, prompt, images }, onDelta);
     if (handler._generate) onDelta(raw);
-    const generatedHtml = sanitizePreviewHtml(raw);
+    const generatedHtml = insertEmbeds(sanitizePreviewHtml(raw), images);
     if (!/<\/body>/i.test(generatedHtml) || !/<\/html>/i.test(generatedHtml)) {
       throw geminiError("generation", "incomplete html");
     }
@@ -563,6 +656,11 @@ async function handler(req, res) {
       prompt,
       submittedAt: new Date().toISOString(),
       generatedHtml,
+      images: images.map((image) => ({
+        role: image.role,
+        mime: image.mime,
+        data: image.data,
+      })),
     };
 
     await Promise.all([postWebhook(payload), sendOwnerEmail(payload)]);

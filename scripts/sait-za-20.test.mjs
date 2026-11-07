@@ -4,6 +4,8 @@ import handler from "../api/sait-za-20.mjs";
 
 const FIXTURE =
   "<!DOCTYPE html><html><head><title>Тест</title></head><body><h1>Здравей</h1><script>alert(1)</script><img src=\"https://evil.example/a.png\"></body></html>";
+const TINY_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 function mockRes() {
   return {
@@ -126,9 +128,11 @@ solo("returns sanitized html and notifies the owner", async () => {
     "business",
     "email",
     "generatedHtml",
+    "images",
     "prompt",
     "submittedAt",
   ]);
+  assert.deepEqual(payload.images, []);
   assert.equal(payload.email, "client@example.com");
   assert.equal(payload.business, "Пекарна");
   assert.equal(payload.prompt, prompt);
@@ -253,4 +257,92 @@ solo("says the generator is not configured when the key is missing", async () =>
   assert.equal(res.statusCode, 503);
   assert.equal(res.payload.error, "config");
   assert.match(res.payload.message, /info@martitony.com/);
+});
+
+solo("rejects more than three photos and a fake image", async () => {
+  const tooMany = await submit({
+    email: "photos@example.com",
+    prompt,
+    images: [1, 2, 3, 4].map(() => ({ role: "style", mime: "image/png", data: TINY_PNG })),
+  });
+  assert.equal(tooMany.statusCode, 400);
+  assert.match(tooMany.payload.message, /3/);
+
+  const fake = await submit({
+    email: "photos@example.com",
+    prompt,
+    images: [{ role: "embed", mime: "image/png", data: "aaaa" }],
+  });
+  assert.equal(fake.statusCode, 400);
+});
+
+solo("embeds a photo through a placeholder and sends only the style photo to Gemini", async () => {
+  process.env.SAIT20_WEBHOOK_URL = "https://hooks.example.com/sait";
+  process.env.SAIT20_WEBHOOK_KEY = "secret-key";
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  delete handler._generate;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      const sse = `data: ${JSON.stringify({
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: '<!DOCTYPE html><html><body><img src="{{PHOTO_1}}" alt="hero"></body></html>',
+                },
+              ],
+            },
+          },
+        ],
+      })}\n\n`;
+      const encoded = new TextEncoder().encode(sse);
+      let sent = false;
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          getReader() {
+            return {
+              async read() {
+                if (sent) return { done: true, value: undefined };
+                sent = true;
+                return { done: false, value: encoded };
+              },
+              async cancel() {},
+            };
+          },
+        },
+      };
+    }
+    return { ok: true, status: 200, text: async () => "" };
+  };
+
+  const res = await submit({
+    email: "photos2@example.com",
+    prompt,
+    images: [
+      { role: "style", mime: "image/png", data: TINY_PNG },
+      { role: "embed", mime: "image/png", data: TINY_PNG },
+    ],
+  });
+  const html = doneHtml(res);
+  assert.match(html, /data:image\/png;base64,/);
+  assert.equal(html.includes("{{PHOTO_1}}"), false);
+  const geminiCall = calls.find((call) => call.url.includes("generativelanguage.googleapis.com"));
+  const gemini = JSON.parse(geminiCall.options.body);
+  const parts = gemini.contents[0].parts;
+  assert.equal(parts.filter((part) => part.inlineData).length, 1);
+  assert.equal(parts[1].inlineData.data, TINY_PNG);
+  assert.equal(parts[0].text.includes(TINY_PNG), false);
+  const webhook = calls.find((call) => call.url.includes("hooks.example.com"));
+  const payload = JSON.parse(webhook.options.body);
+  assert.equal(payload.generatedHtml, html);
+  assert.equal(payload.generatedHtml.includes(TINY_PNG), true);
+  assert.deepEqual(
+    payload.images.map((image) => image.role),
+    ["style", "embed"]
+  );
 });
