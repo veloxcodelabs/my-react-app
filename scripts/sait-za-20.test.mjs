@@ -128,11 +128,14 @@ solo("returns sanitized html and notifies the owner", async () => {
     "business",
     "email",
     "generatedHtml",
-    "images",
+    "photoCount",
+    "photos",
     "prompt",
     "submittedAt",
   ]);
-  assert.deepEqual(payload.images, []);
+  assert.equal(payload.photoCount, 0);
+  assert.deepEqual(payload.photos, []);
+  console.log("WEBHOOK_BYTES_NO_PHOTOS", Buffer.byteLength(webhook.options.body));
   assert.equal(payload.email, "client@example.com");
   assert.equal(payload.business, "Пекарна");
   assert.equal(payload.prompt, prompt);
@@ -339,10 +342,61 @@ solo("embeds a photo through a placeholder and sends only the style photo to Gem
   assert.equal(parts[0].text.includes(TINY_PNG), false);
   const webhook = calls.find((call) => call.url.includes("hooks.example.com"));
   const payload = JSON.parse(webhook.options.body);
-  assert.equal(payload.generatedHtml, html);
-  assert.equal(payload.generatedHtml.includes(TINY_PNG), true);
+  assert.equal(payload.generatedHtml.includes(TINY_PNG), false);
+  assert.equal(payload.generatedHtml.includes("data:image"), false);
+  assert.match(payload.generatedHtml, /\{\{PHOTO_1\}\}/);
+  assert.equal(payload.photoCount, 2);
   assert.deepEqual(
-    payload.images.map((image) => image.role),
+    payload.photos.map((image) => image.role),
     ["style", "embed"]
   );
+  console.log("WEBHOOK_BYTES_TINY_PHOTOS", Buffer.byteLength(webhook.options.body));
+});
+
+solo("omits photos from the webhook when they exceed 200 KB", async () => {
+  process.env.SAIT20_WEBHOOK_URL = "https://hooks.example.com/sait";
+  process.env.SAIT20_WEBHOOK_KEY = "secret-key";
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return { ok: true, status: 200, text: async () => "" };
+  };
+  const bulky = Buffer.concat([
+    Buffer.from(TINY_PNG, "base64"),
+    Buffer.alloc(220 * 1024, 7),
+  ]).toString("base64");
+  handler._generate = async () =>
+    '<!DOCTYPE html><html><body><img src="{{PHOTO_1}}" alt="hero"><p>Пекарна</p></body></html>';
+  const res = await submit({
+    email: "bulky@example.com",
+    prompt,
+    images: [{ role: "embed", mime: "image/png", data: bulky }],
+  });
+  assert.match(doneHtml(res), /data:image\/png;base64,/);
+  const webhook = calls.find((call) => call.url.includes("hooks.example.com"));
+  const payload = JSON.parse(webhook.options.body);
+  assert.equal(payload.photos, undefined);
+  assert.equal(payload.photoCount, 1);
+  assert.equal(payload.generatedHtml.includes(bulky), false);
+  assert.match(payload.generatedHtml, /\{\{PHOTO_1\}\}/);
+  console.log("WEBHOOK_BYTES_OMITTED_PHOTOS", Buffer.byteLength(webhook.options.body));
+});
+
+solo("measures a typical compact-page webhook", async () => {
+  process.env.SAIT20_WEBHOOK_URL = "https://hooks.example.com/sait";
+  process.env.SAIT20_WEBHOOK_KEY = "secret-key";
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return { ok: true, status: 200, text: async () => "" };
+  };
+  const page = `<!DOCTYPE html><html lang="bg"><head><title>Пекарна</title><style>body{margin:0;font-family:sans-serif}</style></head><body><h1>Пекарна Зърно</h1>${"<p>Топъл хляб и баница за семейството в Пловдив.</p>".repeat(80)}</body></html>`;
+  handler._generate = async () => page;
+  await submit({ email: "typical@example.com", business: "Пекарна Зърно", prompt });
+  const webhook = calls.find((call) => call.url.includes("hooks.example.com"));
+  const bytes = Buffer.byteLength(webhook.options.body);
+  const payload = JSON.parse(webhook.options.body);
+  assert.equal(payload.photoCount, 0);
+  assert.ok(bytes < 20000, `typical payload was ${bytes}`);
+  console.log("WEBHOOK_BYTES_TYPICAL_PAGE", bytes, "html", payload.generatedHtml.length);
 });

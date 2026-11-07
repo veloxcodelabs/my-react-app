@@ -20,6 +20,7 @@ const MAX_BUSINESS = 120;
 const MAX_IMAGES = 3;
 const MAX_IMAGE_BASE64 = 1200000;
 const MAX_IMAGES_BASE64 = 3200000;
+const WEBHOOK_PHOTO_BUDGET = 200 * 1024;
 const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_MAX = 5;
 const USED_EMAILS = new Set();
@@ -320,6 +321,29 @@ function collectImages(raw) {
   return { images };
 }
 
+function htmlWithoutEmbeddedImages(html) {
+  return html.replace(/data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=]+/gi, "{{PHOTO_OMITTED}}");
+}
+
+function buildWebhookPayload({ email, business, prompt, submittedAt, placeholderHtml, images }) {
+  const photos = images.map((image) => ({
+    role: image.role,
+    mime: image.mime,
+    data: image.data,
+  }));
+  const photoBytes = Buffer.byteLength(JSON.stringify(photos));
+  const payload = {
+    email,
+    business,
+    prompt,
+    submittedAt,
+    generatedHtml: htmlWithoutEmbeddedImages(placeholderHtml),
+    photoCount: photos.length,
+  };
+  if (photoBytes <= WEBHOOK_PHOTO_BUDGET) payload.photos = photos;
+  return payload;
+}
+
 function insertEmbeds(html, images) {
   const embeds = images.filter((image) => image.role === "embed");
   let result = html;
@@ -492,9 +516,9 @@ async function sendOwnerEmail(payload) {
     "Описание:",
     payload.prompt,
     "",
-    `Снимки: ${(payload.images || []).map((image) => image.role).join(", ") || "няма"}`,
+    `Снимки: ${payload.photoCount}${payload.photos ? "" : " (пропуснати заради размера)"}`,
     "",
-    "Генериран HTML:",
+    "HTML без вградени снимки:",
     payload.generatedHtml,
   ].join("\n");
   const html = [
@@ -646,22 +670,19 @@ async function handler(req, res) {
       ? await handler._generate({ email, business, prompt, images })
       : await generateWithGemini({ business, prompt, images }, onDelta);
     if (handler._generate) onDelta(raw);
-    const generatedHtml = insertEmbeds(sanitizePreviewHtml(raw), images);
+    const placeholderHtml = sanitizePreviewHtml(raw);
+    const generatedHtml = insertEmbeds(placeholderHtml, images);
     if (!/<\/body>/i.test(generatedHtml) || !/<\/html>/i.test(generatedHtml)) {
       throw geminiError("generation", "incomplete html");
     }
-    const payload = {
+    const payload = buildWebhookPayload({
       email,
       business,
       prompt,
       submittedAt: new Date().toISOString(),
-      generatedHtml,
-      images: images.map((image) => ({
-        role: image.role,
-        mime: image.mime,
-        data: image.data,
-      })),
-    };
+      placeholderHtml,
+      images,
+    });
 
     await Promise.all([postWebhook(payload), sendOwnerEmail(payload)]);
     await rememberEmail(email);
