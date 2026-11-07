@@ -248,7 +248,7 @@ async function readGeminiStream(response) {
       }
       text += chunk;
     }
-    if (/<\/html>/i.test(text)) {
+    if (/<\/body>/i.test(text) && /<\/html>/i.test(text)) {
       try {
         await reader.cancel();
       } catch {
@@ -298,7 +298,7 @@ async function generateWithGemini({ business, prompt }) {
       ],
       generationConfig: {
         temperature: 0.7,
-        maxOutputTokens: 5000,
+        maxOutputTokens: 16000,
         thinkingConfig: { thinkingLevel: "low" },
       },
     }),
