@@ -243,7 +243,9 @@ async function generateWithGemini({ business, prompt }) {
 
   const data = await response.json().catch(() => ({}));
   const statusName = data && data.error && data.error.status;
+  const geminiMessage = String((data && data.error && data.error.message) || "").slice(0, 300);
   if (response.status === 429 || statusName === "RESOURCE_EXHAUSTED") {
+    console.error("gemini quota", response.status, statusName || "", geminiMessage);
     throw geminiError("quota", "gemini quota");
   }
   if (!response.ok) {
