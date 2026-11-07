@@ -1,9 +1,10 @@
 // App.tsx
 import React, { useState, useEffect } from "react";
 import { motion, Variants } from "framer-motion";
-import { BrowserRouter as Router, Route, Routes, Link } from "react-router-dom";
+import { BrowserRouter as Router, Route, Routes, Link, useLocation } from "react-router-dom";
 import { createClient } from '@supabase/supabase-js';
 import Promo from './promo'; // Assuming you have a Promo.js or Promo.tsx
+import SaitZa20Page from "./SaitZa20Page";
 
 // Initialize Supabase client
 const supabase = createClient(
@@ -105,7 +106,8 @@ function AIProjectsPage() {
 }
 
 // Main App Component
-export default function App() {
+function Home() {
+  const { pathname } = useLocation();
   const [showPayment, setShowPayment] = useState(false);
 
   useEffect(() => {
@@ -122,12 +124,19 @@ export default function App() {
     document.head.appendChild(script);
 
     return () => {
-      document.head.removeChild(script);
+      script.remove();
+      const paypalRoot = document.getElementById("paypal-container");
+      if (paypalRoot) paypalRoot.replaceChildren();
     };
   }, []);
 
   return (
-    <Router>
+    <>
+      {pathname === "/" && (
+        <Link to="/sait-za-20" style={offerBannerStyle}>
+          Сайт за €20 — опиши го и го виж безплатно
+        </Link>
+      )}
       <div style={container}>
         <div style={missionSection}>
           <h2>Our Mission</h2>
@@ -168,7 +177,33 @@ export default function App() {
 
         <div style={{ textAlign: 'center', fontSize: 10, color: '#777', marginTop: 40, paddingBottom: 30 }} />
       </div>
+    </>
+  );
+}
+
+export default function App() {
+  return (
+    <Router>
+      <AppSwitch />
     </Router>
+  );
+}
+
+function AppSwitch() {
+  const { pathname } = useLocation();
+  const isOffer = pathname === "/sait-za-20" || pathname === "/sait-za-20/";
+
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [pathname]);
+
+  return (
+    <>
+      <div hidden={isOffer}>
+        <Home />
+      </div>
+      {isOffer ? <SaitZa20Page /> : null}
+    </>
   );
 }
 
@@ -205,6 +240,7 @@ const cardVariants: Variants = {
 };
 
 const hue = (h: number) => `hsl(${h},100%,50%)`;
+const offerBannerStyle = { display: "block", width: "100%", boxSizing: "border-box", textAlign: "center", background: "#0070f3", color: "#fff", textDecoration: "none", padding: "10px 16px", fontSize: 14, fontWeight: 600, lineHeight: 1.35 } as const;
 const container = { margin: "100px auto", maxWidth: 500, paddingBottom: 150, width: "100%" } as const;
 const missionSection = { textAlign: "center", marginBottom: 40, padding: "0 20px", color: "#333" } as const;
 const cardContainer = { overflow: "hidden", display: "flex", justifyContent: "center", alignItems: "center", position: "relative", paddingTop: 20, marginBottom: -120 } as const;
