@@ -273,6 +273,36 @@ solo("emails the paid preview once and without the watermark", async () => {
   assert.equal(preview.statusCode, 200);
 });
 
+solo("delivers a purchase through the webhook when email is not configured", async () => {
+  process.env.SAIT20_WEBHOOK_URL = "https://hooks.example.com/sait";
+  process.env.SAIT20_WEBHOOK_KEY = "secret-key";
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => "" };
+  };
+  const body = {
+    action: "purchase",
+    id: "purchase-webhook",
+    email: "buyer@example.com",
+    business: "Пекарна",
+    prompt,
+    html: "<!DOCTYPE html><html><body><h1>Пекарна</h1></body></html>",
+  };
+  const first = await submit(body);
+  const second = await submit(body);
+  assert.equal(first.statusCode, 200);
+  assert.equal(first.payload.email, "skipped");
+  assert.equal(first.payload.webhook, "sent");
+  assert.equal(second.payload.duplicate, true);
+  assert.equal(calls.length, 1);
+  const payload = JSON.parse(calls[0].options.body);
+  assert.equal(payload.source, "sait-za-20-purchase");
+  assert.equal(payload.subject, "Платен сайт €20 — buyer@example.com");
+  assert.match(payload.generatedHtml, /<h1>Пекарна<\/h1>/);
+  assert.equal(calls[0].options.headers["X-Webhook-Key"], "secret-key");
+});
+
 solo("does not spend the free generation when the model fails", async () => {
   handler._generate = async () => {
     throw new Error("gateway down");

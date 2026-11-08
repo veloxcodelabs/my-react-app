@@ -674,16 +674,23 @@ async function handlePurchase(res, body) {
     reply(res, 200, { ok: true, duplicate: true });
     return;
   }
-  const result = await sendPurchaseEmail({
-    id,
-    email,
-    business,
-    prompt,
-    html,
-    submittedAt: new Date().toISOString(),
-  });
-  if (!result.ok) {
-    reply(res, result.skipped ? 503 : 502, {
+  const submittedAt = new Date().toISOString();
+  const purchase = { id, email, business, prompt, html, submittedAt };
+  const [emailResult, webhookResult] = await Promise.all([
+    sendPurchaseEmail(purchase),
+    postWebhook({
+      source: "sait-za-20-purchase",
+      email,
+      business,
+      prompt,
+      submittedAt,
+      purchaseId: id,
+      subject: `Платен сайт €20 — ${email}`,
+      generatedHtml: html,
+    }),
+  ]);
+  if (!emailResult.ok && !webhookResult.ok) {
+    reply(res, emailResult.skipped && webhookResult.skipped ? 503 : 502, {
       ok: false,
       error: "email",
       message: "Не успяхме да изпратим потвърждението. Опитай отново.",
@@ -691,7 +698,11 @@ async function handlePurchase(res, body) {
     return;
   }
   await rememberPurchase(id);
-  reply(res, 200, { ok: true });
+  reply(res, 200, {
+    ok: true,
+    email: emailResult.ok ? "sent" : "skipped",
+    webhook: webhookResult.ok ? "sent" : "skipped",
+  });
 }
 
 async function sendOwnerEmail(payload) {
