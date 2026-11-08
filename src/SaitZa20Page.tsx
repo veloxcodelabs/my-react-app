@@ -399,13 +399,15 @@ export default function SaitZa20Page() {
               >
                 Купувам за €20
               </a>
-              <button
-                type="button"
+              <a
+                href={stripeBuyUrl(preview.email)}
+                target="_blank"
+                rel="noopener noreferrer"
                 style={choice === "design" ? actionOnStyle : actionGhostStyle}
                 onClick={() => setChoice("design")}
               >
                 Искам още дизайн
-              </button>
+              </a>
             </div>
             {choice ? (
               <form style={choiceFormStyle} onSubmit={(event) => event.preventDefault()}>
