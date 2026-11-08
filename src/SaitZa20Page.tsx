@@ -119,8 +119,17 @@ function liveDocument(raw: string) {
   return `<!DOCTYPE html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body>${trimmed}</body></html>`;
 }
 
+const STRIPE_BUY_URL = "https://buy.stripe.com/9B628r8DzdPtecec3jcQU02";
+
 function choiceLabel(choice: Choice) {
   return choice === "buy" ? "Купувам за €20" : "Искам още дизайн";
+}
+
+function stripeBuyUrl(email: string | undefined) {
+  const url = new URL(STRIPE_BUY_URL);
+  const trimmed = email?.trim();
+  if (trimmed) url.searchParams.set("prefilled_email", trimmed);
+  return url.toString();
 }
 
 function mailHref(choice: Choice, preview: Preview, note: string) {
@@ -381,13 +390,15 @@ export default function SaitZa20Page() {
               с домейн и хостинг за 12 месеца.
             </p>
             <div style={actionRowStyle}>
-              <button
-                type="button"
+              <a
+                href={stripeBuyUrl(preview.email)}
+                target="_blank"
+                rel="noopener noreferrer"
                 style={choice === "buy" ? actionOnStyle : actionStyle}
                 onClick={() => setChoice("buy")}
               >
                 Купувам за €20
-              </button>
+              </a>
               <button
                 type="button"
                 style={choice === "design" ? actionOnStyle : actionGhostStyle}
