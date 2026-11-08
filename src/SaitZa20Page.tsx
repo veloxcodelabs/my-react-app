@@ -7,7 +7,11 @@ const PREVIEW_KEY = "sait-za-20-preview";
 const CREDIT_KEY = "sait-za-20-design-credits";
 const NOTICE_KEY = "sait-za-20-paid-notice";
 const RETURN_KEY = "sait-za-20-return-draft";
+const PURCHASE_KEY = "sait-za-20-purchase";
+const PURCHASE_SENT_KEY = "sait-za-20-purchase-sent";
+const BOUGHT_KEY = "sait-za-20-bought";
 const PAID_MESSAGE = "Плащането е получено – можете да направите още един дизайн.";
+const THANK_YOU = "Благодарим за покупката! Ще получите вашия сайт до 48 часа на имейла, който посочихте.";
 const MAX_PROMPT = 2000;
 const MAX_PHOTOS = 3;
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
@@ -26,9 +30,20 @@ interface Photo {
 }
 
 interface Preview {
+  id?: string;
   email: string;
   business: string;
+  prompt?: string;
   html: string;
+}
+
+interface PurchaseRecord {
+  id: string;
+  email: string;
+  business: string;
+  prompt: string;
+  html: string;
+  storedAt: string;
 }
 
 function normalizeEmail(value: string) {
@@ -93,6 +108,113 @@ function takePaidReturn() {
   return true;
 }
 
+function newPurchaseId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function stripPreviewMark(html: string) {
+  return html.replace(/<div id="sait-preview-mark"[\s\S]*?<\/div>\s*<\/div>/gi, "");
+}
+
+function readPurchase(): PurchaseRecord | null {
+  try {
+    const raw = localStorage.getItem(PURCHASE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.id !== "string" || typeof parsed.email !== "string") return null;
+    return {
+      id: parsed.id,
+      email: parsed.email,
+      business: typeof parsed.business === "string" ? parsed.business : "",
+      prompt: typeof parsed.prompt === "string" ? parsed.prompt : "",
+      html: typeof parsed.html === "string" ? parsed.html : "",
+      storedAt: typeof parsed.storedAt === "string" ? parsed.storedAt : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function storePurchase(preview: Preview, promptText: string) {
+  const record: PurchaseRecord = {
+    id: preview.id || newPurchaseId(),
+    email: preview.email,
+    business: preview.business || "",
+    prompt: (promptText || preview.prompt || "").trim(),
+    html: stripPreviewMark(preview.html),
+    storedAt: new Date().toISOString(),
+  };
+  const write = (value: PurchaseRecord) => localStorage.setItem(PURCHASE_KEY, JSON.stringify(value));
+  try {
+    write(record);
+  } catch {
+    try {
+      write({
+        ...record,
+        html: record.html.replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+/g, ""),
+      });
+    } catch {
+      try {
+        write({ ...record, html: "" });
+      } catch {
+        // Stripe still opens if the browser refuses to store the preview.
+      }
+    }
+  }
+}
+
+function updateOpenPurchase(preview: Preview) {
+  const current = readPurchase();
+  if (!current || current.email !== preview.email) return;
+  try {
+    if (localStorage.getItem(PURCHASE_SENT_KEY) === current.id) return;
+  } catch {
+    return;
+  }
+  storePurchase({ ...preview, id: current.id }, preview.prompt || current.prompt);
+}
+
+let purchaseNotifyClaimed = false;
+
+async function notifyPurchase() {
+  const record = readPurchase();
+  if (!record || !/^[A-Za-z0-9._:-]{8,80}$/.test(record.id)) return;
+  try {
+    if (localStorage.getItem(PURCHASE_SENT_KEY) === record.id) return;
+  } catch {
+    return;
+  }
+  if (purchaseNotifyClaimed) return;
+  purchaseNotifyClaimed = true;
+  try {
+    const response = await fetch("/api/sait-za-20", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "purchase", ...record }),
+    });
+    if (response.ok) localStorage.setItem(PURCHASE_SENT_KEY, record.id);
+    else purchaseNotifyClaimed = false;
+  } catch {
+    purchaseNotifyClaimed = false;
+  }
+}
+
+function takeBoughtReturn() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("bought") !== "1") return false;
+  try {
+    sessionStorage.setItem(BOUGHT_KEY, "1");
+  } catch {
+    // The thank-you screen still shows for this visit.
+  }
+  params.delete("bought");
+  const query = params.toString();
+  const next = `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`;
+  window.history.replaceState(null, "", next);
+  return true;
+}
+
 function readPreview(): Preview | null {
   try {
     const raw = sessionStorage.getItem(PREVIEW_KEY);
@@ -100,8 +222,10 @@ function readPreview(): Preview | null {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed.html !== "string" || typeof parsed.email !== "string") return null;
     return {
+      id: typeof parsed.id === "string" ? parsed.id : undefined,
       email: parsed.email,
       business: typeof parsed.business === "string" ? parsed.business : "",
+      prompt: typeof parsed.prompt === "string" ? parsed.prompt : "",
       html: parsed.html,
     };
   } catch {
@@ -202,6 +326,7 @@ export default function SaitZa20Page() {
   const [note, setNote] = useState("");
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [paidNotice, setPaidNotice] = useState("");
+  const [purchased, setPurchased] = useState(false);
   const frameRef = useRef<HTMLIFrameElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -210,6 +335,12 @@ export default function SaitZa20Page() {
     const previousLang = document.documentElement.lang;
     document.title = "Сайт за €20 — Marti Tony Studio";
     document.documentElement.lang = "bg";
+    if (takeBoughtReturn()) void notifyPurchase();
+    try {
+      if (sessionStorage.getItem(BOUGHT_KEY) === "1") setPurchased(true);
+    } catch {
+      // The thank-you screen is skipped if session storage is blocked.
+    }
     const saved = readPreview();
     const granted = takePaidReturn();
     if (granted) {
@@ -387,8 +518,15 @@ export default function SaitZa20Page() {
               });
             }
           } else if (event.type === "done" && typeof event.html === "string") {
-            const nextPreview = { email: nextEmail, business: nextBusiness, html: event.html };
+            const nextPreview = {
+              id: newPurchaseId(),
+              email: nextEmail,
+              business: nextBusiness,
+              prompt: nextPrompt,
+              html: event.html,
+            };
             rememberEmail(nextEmail);
+            updateOpenPurchase(nextPreview);
             try {
               sessionStorage.setItem(PREVIEW_KEY, JSON.stringify(nextPreview));
               sessionStorage.removeItem(RETURN_KEY);
@@ -467,7 +605,14 @@ export default function SaitZa20Page() {
           </Link>
         )}
       </header>
-      <main style={preview ? wideStyle : mainStyle}>
+      <main style={!purchased && preview ? wideStyle : mainStyle}>
+        {purchased ? (
+          <section role="status" style={thanksStyle}>
+            <p style={eyebrowStyle}>Marti Tony Studio</p>
+            <h1 style={thanksTitleStyle}>{THANK_YOU}</h1>
+          </section>
+        ) : (
+          <>
         <p style={eyebrowStyle}>Marti Tony Studio</p>
         <h1 style={titleStyle}>Сайт за €20 + безплатен домейн и хостинг за 12 месеца</h1>
         <p style={leadStyle}>
@@ -508,7 +653,10 @@ export default function SaitZa20Page() {
                 target="_blank"
                 rel="noopener noreferrer"
                 style={choice === "buy" ? actionOnStyle : actionStyle}
-                onClick={() => setChoice("buy")}
+                onClick={() => {
+                  storePurchase(preview, prompt || preview.prompt || "");
+                  setChoice("buy");
+                }}
               >
                 Купувам за €20
               </a>
@@ -662,6 +810,8 @@ export default function SaitZa20Page() {
               Виж безплатния преглед
             </button>
           </form>
+        )}
+          </>
         )}
       </main>
     </div>
@@ -886,6 +1036,20 @@ const hintStyle: React.CSSProperties = {
   color: "#555",
   fontSize: 14,
   lineHeight: 1.45,
+};
+
+const thanksStyle: React.CSSProperties = {
+  background: "#f5f5f5",
+  borderRadius: 20,
+  padding: "36px 22px",
+  textAlign: "center",
+};
+
+const thanksTitleStyle: React.CSSProperties = {
+  margin: "12px 0 0",
+  fontSize: 28,
+  lineHeight: 1.35,
+  fontWeight: 800,
 };
 
 const paidNoticeStyle: React.CSSProperties = {

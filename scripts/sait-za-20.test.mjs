@@ -230,6 +230,49 @@ solo("does not spend the paid credit when that generation fails", async () => {
   assert.equal(again.statusCode, 409);
 });
 
+solo("emails the paid preview once and without the watermark", async () => {
+  process.env.RESEND_API_KEY = "re_test";
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => "" };
+  };
+  const marked =
+    '<!DOCTYPE html><html><body><h1>Пекарна</h1><div id="sait-preview-mark"><div>ПРЕГЛЕД</div></div></body></html>';
+  const body = {
+    action: "purchase",
+    id: "purchase-1234",
+    email: "Buyer@Example.com",
+    business: "Пекарна",
+    prompt,
+    html: marked,
+  };
+  const first = await submit(body);
+  const second = await submit(body);
+  assert.equal(first.statusCode, 200);
+  assert.equal(first.payload.ok, true);
+  assert.equal(second.statusCode, 200);
+  assert.equal(second.payload.duplicate, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.resend.com/emails");
+  const message = JSON.parse(calls[0].options.body);
+  assert.equal(message.subject, "Платен сайт €20 — buyer@example.com");
+  assert.deepEqual(message.to, ["info@martitony.com"]);
+  assert.match(message.text, /buyer@example.com/);
+  assert.match(message.text, /Пекарна/);
+  assert.match(message.text, new RegExp(prompt.slice(0, 20)));
+  assert.match(message.text, /<h1>Пекарна<\/h1>/);
+  assert.doesNotMatch(message.text, /sait-preview-mark/);
+  assert.equal(message.attachments[0].filename, "sait-preview.html");
+  const attached = Buffer.from(message.attachments[0].content, "base64").toString("utf8");
+  assert.match(attached, /<h1>Пекарна<\/h1>/);
+  assert.doesNotMatch(attached, /sait-preview-mark/);
+  assert.equal(calls[0].options.headers["Idempotency-Key"], "sait-purchase/purchase-1234");
+
+  const preview = await submit({ email: "buyer@example.com", prompt });
+  assert.equal(preview.statusCode, 200);
+});
+
 solo("does not spend the free generation when the model fails", async () => {
   handler._generate = async () => {
     throw new Error("gateway down");

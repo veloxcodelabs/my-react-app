@@ -26,6 +26,7 @@ const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_MAX = 5;
 const USED_EMAILS = new Set();
 const PAID_EMAILS = new Set();
+const PURCHASES = new Set();
 const IN_FLIGHT = new Set();
 const RATE_HITS = new Map();
 
@@ -532,6 +533,167 @@ async function postWebhook(payload) {
   }
 }
 
+function stripPreviewMark(html) {
+  return String(html || "").replace(/<div id="sait-preview-mark"[\s\S]*?<\/div>\s*<\/div>/gi, "");
+}
+
+function purchaseRequest(id) {
+  return new Request(`https://sait-za-20.internal/purchase/${encodeURIComponent(id)}`);
+}
+
+async function purchaseAlreadySent(id) {
+  if (PURCHASES.has(id)) return true;
+  if (typeof caches === "undefined" || typeof caches.open !== "function") return false;
+  try {
+    const cache = await caches.open("sait-za-20");
+    const hit = await cache.match(purchaseRequest(id));
+    if (hit) {
+      PURCHASES.add(id);
+      return true;
+    }
+  } catch {
+    console.error("purchase dedupe read failed");
+  }
+  return false;
+}
+
+async function rememberPurchase(id) {
+  PURCHASES.add(id);
+  if (typeof caches === "undefined" || typeof caches.open !== "function") return;
+  try {
+    const cache = await caches.open("sait-za-20");
+    await cache.put(
+      purchaseRequest(id),
+      new Response("1", {
+        headers: { "Cache-Control": "public, max-age=31536000" },
+      })
+    );
+  } catch {
+    console.error("purchase dedupe write failed");
+  }
+}
+
+async function sendPurchaseEmail(payload) {
+  const apiKey = env("RESEND_API_KEY");
+  if (!apiKey) {
+    console.error("RESEND_API_KEY is not set; purchase email skipped");
+    return { skipped: true, ok: false };
+  }
+
+  const from = env("RESEND_FROM_EMAIL") || "Marti Tony Studio <onboarding@resend.dev>";
+  const businessLine = payload.business || "—";
+  const promptLine = payload.prompt || "—";
+  const subject = `Платен сайт €20 — ${payload.email}`.replace(/[\r\n]+/g, " ").slice(0, 180);
+  const htmlNote = payload.html
+    ? "Пълният HTML без воден знак е приложен като sait-preview.html."
+    : "HTML на прегледа не беше наличен в браузъра.";
+  const text = [
+    "Платен сайт за €20.",
+    "",
+    `Имейл: ${payload.email}`,
+    `Бизнес: ${businessLine}`,
+    `Платено: ${payload.submittedAt}`,
+    `Покупка: ${payload.id}`,
+    "",
+    "Описание:",
+    promptLine,
+    "",
+    htmlNote,
+    "",
+    payload.html || "",
+  ].join("\n");
+  const html = [
+    "<h2>Платен сайт за €20</h2>",
+    `<p><strong>Имейл:</strong> ${escapeHtml(payload.email)}</p>`,
+    `<p><strong>Бизнес:</strong> ${escapeHtml(businessLine)}</p>`,
+    `<p><strong>Платено:</strong> ${escapeHtml(payload.submittedAt)}</p>`,
+    `<p><strong>Покупка:</strong> ${escapeHtml(payload.id)}</p>`,
+    "<p><strong>Описание:</strong></p>",
+    `<pre style="white-space:pre-wrap;font-family:inherit;">${escapeHtml(promptLine)}</pre>`,
+    `<p>${escapeHtml(htmlNote)}</p>`,
+  ].join("");
+  const message = {
+    from,
+    to: [OWNER_EMAIL],
+    reply_to: payload.email,
+    subject,
+    text,
+    html,
+  };
+  if (payload.html) {
+    message.attachments = [
+      {
+        filename: "sait-preview.html",
+        content: Buffer.from(payload.html, "utf8").toString("base64"),
+      },
+    ];
+  }
+
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "Idempotency-Key": `sait-purchase/${payload.id}`.slice(0, 256),
+      },
+      body: JSON.stringify(message),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) {
+      const details = await response.text();
+      console.error("purchase resend failed", response.status, details.slice(0, 400));
+      return { skipped: false, ok: false };
+    }
+    return { skipped: false, ok: true };
+  } catch (error) {
+    console.error("purchase resend error", error && error.message ? error.message : "unknown");
+    return { skipped: false, ok: false };
+  }
+}
+
+async function handlePurchase(res, body) {
+  const id = asText(body.id);
+  const email = normalizeEmail(body.email);
+  const business = asText(body.business);
+  const prompt = asText(body.prompt);
+  const html = stripPreviewMark(typeof body.html === "string" ? body.html : "");
+  if (!/^[A-Za-z0-9._:-]{8,80}$/.test(id)) {
+    reply(res, 400, { ok: false, error: "validation", message: "Липсва номер на покупката." });
+    return;
+  }
+  if (!isValidEmail(email)) {
+    reply(res, 400, { ok: false, error: "validation", message: "Въведи валиден имейл." });
+    return;
+  }
+  if (business.length > MAX_BUSINESS || prompt.length > MAX_PROMPT || html.length > 3500000) {
+    reply(res, 400, { ok: false, error: "validation", message: "Данните за покупката са твърде големи." });
+    return;
+  }
+  if (await purchaseAlreadySent(id)) {
+    reply(res, 200, { ok: true, duplicate: true });
+    return;
+  }
+  const result = await sendPurchaseEmail({
+    id,
+    email,
+    business,
+    prompt,
+    html,
+    submittedAt: new Date().toISOString(),
+  });
+  if (!result.ok) {
+    reply(res, result.skipped ? 503 : 502, {
+      ok: false,
+      error: "email",
+      message: "Не успяхме да изпратим потвърждението. Опитай отново.",
+    });
+    return;
+  }
+  await rememberPurchase(id);
+  reply(res, 200, { ok: true });
+}
+
 async function sendOwnerEmail(payload) {
   const apiKey = env("RESEND_API_KEY");
   if (!apiKey) {
@@ -609,6 +771,10 @@ async function handler(req, res) {
   const body = readJson(req);
   if (!body || typeof body !== "object") {
     reply(res, 400, { ok: false, error: "validation", message: "Невалидни данни." });
+    return;
+  }
+  if (body.action === "purchase") {
+    await handlePurchase(res, body);
     return;
   }
 
@@ -740,6 +906,7 @@ async function handler(req, res) {
 handler._reset = () => {
   USED_EMAILS.clear();
   PAID_EMAILS.clear();
+  PURCHASES.clear();
   IN_FLIGHT.clear();
   RATE_HITS.clear();
 };
