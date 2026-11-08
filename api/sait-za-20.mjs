@@ -1,7 +1,8 @@
 /**
  * POST /api/sait-za-20
  *
- * Generates one Bulgarian HTML preview per email, shows it to the visitor,
+ * Generates one free Bulgarian HTML preview per email, plus one paid extra
+ * when the client sends usePaidCredit. Shows it to the visitor,
  * emails info@martitony.com, and POSTs the same submission to the webhook.
  *
  * Env:
@@ -24,6 +25,7 @@ const WEBHOOK_PHOTO_BUDGET = 200 * 1024;
 const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_MAX = 5;
 const USED_EMAILS = new Set();
+const PAID_EMAILS = new Set();
 const IN_FLIGHT = new Set();
 const RATE_HITS = new Map();
 
@@ -143,6 +145,42 @@ async function rememberEmail(email) {
     );
   } catch {
     console.error("preview dedupe write failed");
+  }
+}
+
+function paidRequest(email) {
+  return new Request(`https://sait-za-20.internal/paid/${encodeURIComponent(email)}`);
+}
+
+async function hasUsedPaidCredit(email) {
+  if (PAID_EMAILS.has(email)) return true;
+  if (typeof caches === "undefined" || typeof caches.open !== "function") return false;
+  try {
+    const cache = await caches.open("sait-za-20");
+    const hit = await cache.match(paidRequest(email));
+    if (hit) {
+      PAID_EMAILS.add(email);
+      return true;
+    }
+  } catch {
+    console.error("paid credit read failed");
+  }
+  return false;
+}
+
+async function rememberPaidCredit(email) {
+  PAID_EMAILS.add(email);
+  if (typeof caches === "undefined" || typeof caches.open !== "function") return;
+  try {
+    const cache = await caches.open("sait-za-20");
+    await cache.put(
+      paidRequest(email),
+      new Response("1", {
+        headers: { "Cache-Control": "public, max-age=31536000" },
+      })
+    );
+  } catch {
+    console.error("paid credit write failed");
   }
 }
 
@@ -613,7 +651,9 @@ async function handler(req, res) {
   }
   const images = collected.images;
 
-  if (await hasUsedEmail(email)) {
+  const freeUsed = await hasUsedEmail(email);
+  const redeeming = body.usePaidCredit === true && freeUsed;
+  if (freeUsed && (!redeeming || (await hasUsedPaidCredit(email)))) {
     reply(res, 409, {
       ok: false,
       error: "duplicate",
@@ -686,6 +726,7 @@ async function handler(req, res) {
 
     await Promise.all([postWebhook(payload), sendOwnerEmail(payload)]);
     await rememberEmail(email);
+    if (redeeming) await rememberPaidCredit(email);
     if (!streaming) startStream(res);
     writeEvent(res, { type: "done", html: generatedHtml });
     res.end();
@@ -698,6 +739,7 @@ async function handler(req, res) {
 
 handler._reset = () => {
   USED_EMAILS.clear();
+  PAID_EMAILS.clear();
   IN_FLIGHT.clear();
   RATE_HITS.clear();
 };

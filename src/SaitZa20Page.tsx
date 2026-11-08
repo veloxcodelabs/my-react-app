@@ -4,6 +4,10 @@ import { isGeneratorHost, MAIN_SITE_URL } from "./generatorHost";
 
 const STORAGE_KEY = "sait-za-20-used-emails";
 const PREVIEW_KEY = "sait-za-20-preview";
+const CREDIT_KEY = "sait-za-20-design-credits";
+const NOTICE_KEY = "sait-za-20-paid-notice";
+const RETURN_KEY = "sait-za-20-return-draft";
+const PAID_MESSAGE = "Плащането е получено – можете да направите още един дизайн.";
 const MAX_PROMPT = 2000;
 const MAX_PHOTOS = 3;
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
@@ -45,6 +49,48 @@ function rememberEmail(email: string) {
   const used = new Set(readUsedEmails());
   used.add(normalizeEmail(email));
   localStorage.setItem(STORAGE_KEY, JSON.stringify(Array.from(used)));
+}
+
+function readCredits() {
+  try {
+    const value = Number(localStorage.getItem(CREDIT_KEY));
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeCredits(count: number) {
+  if (count > 0) localStorage.setItem(CREDIT_KEY, String(count));
+  else localStorage.removeItem(CREDIT_KEY);
+}
+
+function readReturnDraft(): { email: string; business: string } | null {
+  try {
+    const raw = sessionStorage.getItem(RETURN_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.email !== "string") return null;
+    return { email: parsed.email, business: typeof parsed.business === "string" ? parsed.business : "" };
+  } catch {
+    return null;
+  }
+}
+
+function takePaidReturn() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("paid") !== "1") return false;
+  writeCredits(readCredits() + 1);
+  try {
+    sessionStorage.setItem(NOTICE_KEY, "1");
+  } catch {
+    // The credit is already stored; the message is shown from this visit's state.
+  }
+  params.delete("paid");
+  const query = params.toString();
+  const next = `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`;
+  window.history.replaceState(null, "", next);
+  return true;
 }
 
 function readPreview(): Preview | null {
@@ -120,13 +166,14 @@ function liveDocument(raw: string) {
 }
 
 const STRIPE_BUY_URL = "https://buy.stripe.com/9B628r8DzdPtecec3jcQU02";
+const STRIPE_DESIGN_URL = "https://buy.stripe.com/3cI6oH0738v9c465EVcQU03";
 
 function choiceLabel(choice: Choice) {
   return choice === "buy" ? "Купувам за €20" : "Искам още дизайн";
 }
 
-function stripeBuyUrl(email: string | undefined) {
-  const url = new URL(STRIPE_BUY_URL);
+function stripeUrl(base: string, email: string | undefined) {
+  const url = new URL(base);
   const trimmed = email?.trim();
   if (trimmed) url.searchParams.set("prefilled_email", trimmed);
   return url.toString();
@@ -154,6 +201,7 @@ export default function SaitZa20Page() {
   const [choice, setChoice] = useState<Choice | null>(null);
   const [note, setNote] = useState("");
   const [photos, setPhotos] = useState<Photo[]>([]);
+  const [paidNotice, setPaidNotice] = useState("");
   const frameRef = useRef<HTMLIFrameElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -163,7 +211,32 @@ export default function SaitZa20Page() {
     document.title = "Сайт за €20 — Marti Tony Studio";
     document.documentElement.lang = "bg";
     const saved = readPreview();
-    if (saved) setPreview(saved);
+    const granted = takePaidReturn();
+    if (granted) {
+      try {
+        if (saved?.email) {
+          sessionStorage.setItem(RETURN_KEY, JSON.stringify({ email: saved.email, business: saved.business }));
+        }
+        sessionStorage.removeItem(PREVIEW_KEY);
+      } catch {
+        // The form is shown for this visit even if the old preview cannot be cleared.
+      }
+    }
+    const draft = readReturnDraft();
+    if (granted || draft) {
+      if (draft) {
+        setEmail(draft.email);
+        setBusiness(draft.business);
+      }
+      setPreview(null);
+    } else if (saved) {
+      setPreview(saved);
+    }
+    try {
+      if (sessionStorage.getItem(NOTICE_KEY) === "1") setPaidNotice(PAID_MESSAGE);
+    } catch {
+      // The payment message is optional if session storage is blocked.
+    }
     return () => {
       document.title = previousTitle;
       document.documentElement.lang = previousLang;
@@ -238,52 +311,54 @@ export default function SaitZa20Page() {
       setMessage(`Описанието е твърде дълго. Съкрати го до ${MAX_PROMPT} знака.`);
       return;
     }
-    if (readUsedEmails().includes(nextEmail)) {
+    const alreadyUsed = readUsedEmails().includes(nextEmail);
+    let redeeming = alreadyUsed && readCredits() > 0;
+    if (alreadyUsed && !redeeming) {
       setStatus("error");
       setMessage("Този имейл вече е използван за безплатния преглед.");
       return;
     }
-    const payload = JSON.stringify({
+    const images = photos.map((photo) => ({ role: photo.role, mime: photo.mime, data: photo.dataUrl }));
+    const payloadSize = JSON.stringify({
       email: nextEmail,
       business: nextBusiness,
       prompt: nextPrompt,
-      images: photos.map((photo) => ({ role: photo.role, mime: photo.mime, data: photo.dataUrl })),
-    });
-    if (payload.length > 3800000) {
+      images,
+      usePaidCredit: true,
+    }).length;
+    if (payloadSize > 3800000) {
       setStatus("error");
       setMessage("Снимките заедно са твърде големи. Махни една или качи по-малки.");
       return;
     }
 
-    setStatus("sending");
-    setMessage("");
     const chosenPhotos = photos;
-
-    try {
+    const requestPreview = async (usePaidCredit: boolean) => {
       const response = await fetch("/api/sait-za-20", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: payload,
+        body: JSON.stringify({
+          email: nextEmail,
+          business: nextBusiness,
+          prompt: nextPrompt,
+          images,
+          ...(usePaidCredit ? { usePaidCredit: true } : {}),
+        }),
       });
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("text/event-stream")) {
         const data = await response.json().catch(() => ({}));
-        if (response.status === 409 || data.error === "duplicate") {
-          rememberEmail(nextEmail);
-          setStatus("error");
-          setMessage(data.message || "Този имейл вече е използван за безплатния преглед.");
-          return;
-        }
+        if (response.status === 409 || data.error === "duplicate") return "duplicate" as const;
         setStatus("error");
         setMessage(data.message || "Не успяхме да направим прегледа. Опитай отново след малко.");
-        return;
+        return "fail" as const;
       }
 
       const reader = response.body?.getReader();
       if (!reader) {
         setStatus("error");
         setMessage("Не успяхме да направим прегледа. Опитай отново след малко.");
-        return;
+        return "fail" as const;
       }
       const decoder = new TextDecoder();
       let buffer = "";
@@ -316,6 +391,7 @@ export default function SaitZa20Page() {
             rememberEmail(nextEmail);
             try {
               sessionStorage.setItem(PREVIEW_KEY, JSON.stringify(nextPreview));
+              sessionStorage.removeItem(RETURN_KEY);
             } catch {
               // The preview still stays on screen if the browser refuses to store it.
             }
@@ -329,6 +405,7 @@ export default function SaitZa20Page() {
             setStatus("error");
             setMessage(event.message || "Не успяхме да направим прегледа. Опитай отново след малко.");
             finished = true;
+            return "fail" as const;
           }
         }
       }
@@ -336,6 +413,37 @@ export default function SaitZa20Page() {
         setPreview(null);
         setStatus("error");
         setMessage("Не успяхме да направим прегледа. Опитай отново след малко.");
+        return "fail" as const;
+      }
+      return "ok" as const;
+    };
+
+    setStatus("sending");
+    setMessage("");
+
+    try {
+      let outcome = await requestPreview(redeeming);
+      if (outcome === "duplicate" && !redeeming && readCredits() > 0) {
+        redeeming = true;
+        setStatus("sending");
+        setMessage("");
+        outcome = await requestPreview(true);
+      }
+      if (outcome === "ok" && redeeming) {
+        writeCredits(readCredits() - 1);
+        if (readCredits() < 1) {
+          try {
+            sessionStorage.removeItem(NOTICE_KEY);
+          } catch {
+            // The credit is already spent.
+          }
+          setPaidNotice("");
+        }
+      }
+      if (outcome === "duplicate") {
+        rememberEmail(nextEmail);
+        setStatus("error");
+        setMessage("Този имейл вече е използван за безплатния преглед.");
       }
     } catch {
       setStatus("error");
@@ -367,6 +475,11 @@ export default function SaitZa20Page() {
           един на имейл. Ако ти хареса, купуваш го за €20. Ако искаш друг дизайн, пишеш какво
           да променим.
         </p>
+        {paidNotice ? (
+          <p role="status" style={paidNoticeStyle}>
+            {paidNotice}
+          </p>
+        ) : null}
 
         {preview ? (
           <section aria-live="polite">
@@ -391,7 +504,7 @@ export default function SaitZa20Page() {
             </p>
             <div style={actionRowStyle}>
               <a
-                href={stripeBuyUrl(preview.email)}
+                href={stripeUrl(STRIPE_BUY_URL, preview.email)}
                 target="_blank"
                 rel="noopener noreferrer"
                 style={choice === "buy" ? actionOnStyle : actionStyle}
@@ -400,7 +513,7 @@ export default function SaitZa20Page() {
                 Купувам за €20
               </a>
               <a
-                href={stripeBuyUrl(preview.email)}
+                href={stripeUrl(STRIPE_DESIGN_URL, preview.email)}
                 target="_blank"
                 rel="noopener noreferrer"
                 style={choice === "design" ? actionOnStyle : actionGhostStyle}
@@ -772,6 +885,17 @@ const hintStyle: React.CSSProperties = {
   margin: "8px 0 0",
   color: "#555",
   fontSize: 14,
+  lineHeight: 1.45,
+};
+
+const paidNoticeStyle: React.CSSProperties = {
+  margin: "16px 0 0",
+  background: "#ecfdf3",
+  color: "#166534",
+  borderRadius: 12,
+  padding: "12px 14px",
+  fontSize: 15,
+  fontWeight: 700,
   lineHeight: 1.45,
 };
 

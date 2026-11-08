@@ -189,6 +189,47 @@ solo("allows one free generation per email", async () => {
   assert.equal(calls, 1);
 });
 
+solo("a paid credit allows one extra generation and only once", async () => {
+  let calls = 0;
+  handler._generate = async () => {
+    calls += 1;
+    return FIXTURE;
+  };
+  const body = { email: "paid@example.com", prompt };
+  const first = await submit(body);
+  const blocked = await submit(body);
+  const extra = await submit({ ...body, usePaidCredit: true });
+  const again = await submit({ ...body, usePaidCredit: true });
+  assert.equal(first.statusCode, 200);
+  assert.equal(blocked.statusCode, 409);
+  assert.equal(extra.statusCode, 200);
+  assert.equal(again.statusCode, 409);
+  assert.equal(again.payload.error, "duplicate");
+  assert.equal(calls, 2);
+});
+
+solo("a paid flag on the free generation does not use up the extra", async () => {
+  const body = { email: "flag@example.com", prompt, usePaidCredit: true };
+  assert.equal((await submit(body)).statusCode, 200);
+  assert.equal((await submit(body)).statusCode, 200);
+  assert.equal((await submit(body)).statusCode, 409);
+});
+
+solo("does not spend the paid credit when that generation fails", async () => {
+  const body = { email: "paid-retry@example.com", prompt };
+  assert.equal((await submit(body)).statusCode, 200);
+  handler._generate = async () => {
+    throw new Error("gateway down");
+  };
+  const failed = await submit({ ...body, usePaidCredit: true });
+  assert.equal(failed.statusCode, 503);
+  handler._generate = async () => FIXTURE;
+  const extra = await submit({ ...body, usePaidCredit: true });
+  assert.equal(extra.statusCode, 200);
+  const again = await submit({ ...body, usePaidCredit: true });
+  assert.equal(again.statusCode, 409);
+});
+
 solo("does not spend the free generation when the model fails", async () => {
   handler._generate = async () => {
     throw new Error("gateway down");
