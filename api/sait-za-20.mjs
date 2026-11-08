@@ -9,11 +9,12 @@
  * - GEMINI_API_KEY: Google Gemini API key (required to generate)
  * - GEMINI_MODEL: optional model id, default gemini-3.5-flash-lite
  * - RESEND_API_KEY: owner email backup
- * - RESEND_FROM_EMAIL: optional verified sender
+ * - RESEND_FROM_EMAIL: unused; the account has no verified domain, so mail is sent from onboarding@resend.dev
  * - SAIT20_WEBHOOK_URL / SAIT20_WEBHOOK_KEY: optional JSON webhook
  */
 
 const OWNER_EMAIL = "info@martitony.com";
+const RESEND_FROM = "onboarding@resend.dev";
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_PROMPT = 2000;
@@ -40,6 +41,15 @@ Never write base64 or data: URLs. If the user lists {{PHOTO_N}} tokens, use thos
 function env(name) {
   const value = process.env[name];
   return typeof value === "string" ? value.trim() : "";
+}
+
+function resendId(body) {
+  try {
+    const parsed = JSON.parse(body);
+    return parsed && parsed.id ? parsed.id : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function normalizeEmail(value) {
@@ -580,7 +590,7 @@ async function sendPurchaseEmail(payload) {
     return { skipped: true, ok: false };
   }
 
-  const from = env("RESEND_FROM_EMAIL") || "Marti Tony Studio <onboarding@resend.dev>";
+  const from = RESEND_FROM;
   const businessLine = payload.business || "—";
   const promptLine = payload.prompt || "—";
   const subject = `Платен сайт €20 — ${payload.email}`.replace(/[\r\n]+/g, " ").slice(0, 180);
@@ -640,11 +650,12 @@ async function sendPurchaseEmail(payload) {
       body: JSON.stringify(message),
       signal: AbortSignal.timeout(10000),
     });
+    const details = await response.text();
     if (!response.ok) {
-      const details = await response.text();
       console.error("purchase resend failed", response.status, details.slice(0, 400));
       return { skipped: false, ok: false };
     }
+    console.log("purchase resend sent", resendId(details));
     return { skipped: false, ok: true };
   } catch (error) {
     console.error("purchase resend error", error && error.message ? error.message : "unknown");
@@ -712,7 +723,7 @@ async function sendOwnerEmail(payload) {
     return { skipped: true, ok: false };
   }
 
-  const from = env("RESEND_FROM_EMAIL") || "Marti Tony Studio <onboarding@resend.dev>";
+  const from = RESEND_FROM;
   const businessLine = payload.business || "—";
   const subject = `Сайт за €20 — ${payload.business || payload.email}`
     .replace(/[\r\n]+/g, " ")
@@ -760,11 +771,12 @@ async function sendOwnerEmail(payload) {
       }),
       signal: AbortSignal.timeout(10000),
     });
+    const details = await response.text();
     if (!response.ok) {
-      const details = await response.text();
       console.error("resend failed", response.status, details.slice(0, 400));
       return { skipped: false, ok: false };
     }
+    console.log("resend sent", resendId(details));
     return { skipped: false, ok: true };
   } catch (error) {
     console.error("resend error", error && error.message ? error.message : "unknown");
